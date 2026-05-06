@@ -20,6 +20,7 @@ GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
 # ============================================================
 on  = True
 off = False
+
 FILTER_INSECURE    = on    # on = скрыть ⚠️  небезопасные (нет TLS / allowInsecure=1)
 FILTER_LOCK        = on    # on = скрыть 🔒  обычный TLS  (оставить только Reality 🔑)
 FILTER_RUSSIAN     = on    # on = скрыть 🇷🇺  российские  (IP + домен + тег + SNI)
@@ -30,7 +31,7 @@ SNI_CHECK_TIMEOUT  = 4.0
 # ============================================================
 # ЦЕПОЧКА ЧЕРЕЗ РОССИЙСКИЕ СЕРВЕРЫ (chain proxy)
 # ============================================================
-CHAIN_PROXY = off
+CHAIN_PROXY = on
 CHAIN_TOP_N = 8
 
 # Этап 1
@@ -749,20 +750,30 @@ def _build_xray_config_trojan(url: str, port: int):
 
 
 def _check_google_ban(session: requests.Session) -> bool:
+    """
+    Проверяет не заблокирован ли сервер Google-ом (captcha/sorry).
+    Возвращает False ТОЛЬКО если явно получили редирект на sorry/captcha.
+    В любом другом случае (ошибка, таймаут, 204, 200) — пропускаем сервер.
+    Это важно: с GitHub Actions многие серверы не открывают Google
+    из-за GeoIP-блокировок самого Google, но при этом работают нормально.
+    """
     try:
         r = session.get(
             "http://www.google.com/generate_204",
-            timeout=5.0,
+            timeout=4.0,
             allow_redirects=False,
         )
         if r.status_code == 204:
             return True
         if r.status_code in (301, 302):
-            location = r.headers.get('Location', '')
-            if 'sorry' in location or 'captcha' in location:
+            location = r.headers.get('Location', '').lower()
+            # Блокируем только явный редирект на captcha
+            if 'sorry.google' in location or '/sorry/' in location:
                 return False
+        # Любой другой ответ (включая 403, 200, timeout) — не блокируем
         return True
     except Exception:
+        # Сервер не открывает Google — это нормально, не блокируем
         return True
 
 
