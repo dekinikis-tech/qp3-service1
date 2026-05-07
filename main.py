@@ -21,11 +21,11 @@ GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
 on  = True
 off = False
 
-FILTER_INSECURE     = on   # Удаляет серверы без шифрования (защита от перехвата)
-FILTER_LOCK         = on   # Оставляет ТОЛЬКО Reality. Остальное (TLS, Hysteria) удаляется
-FILTER_RUSSIAN      = on   # Полностью исключает серверы, находящиеся в РФ[cite: 1]
-FILTER_INVALID_PBK  = on   # Удаляет конфиги с битыми ключами Reality[cite: 1]
-FILTER_DEAD_SNI     = on   # Удаляет серверы, если их сайт-маскировка не отвечает[cite: 1]
+FILTER_INSECURE    = on    # on = скрыть ⚠️  небезопасные (нет TLS / allowInsecure=1)
+FILTER_LOCK        = on    # on = скрыть 🔒  обычный TLS  (оставить только Reality 🔑)
+FILTER_RUSSIAN     = on    # on = скрыть 🇷🇺  российские  (IP + домен + тег + SNI)
+FILTER_INVALID_PBK = on    # on = скрыть серверы с невалидным pbk ключом Reality
+FILTER_DEAD_SNI    = on    # on = скрыть серверы у которых SNI-сайт не отвечает
 
 SNI_CHECK_TIMEOUT  = 4.0
 
@@ -56,6 +56,7 @@ TEST_URLS = [
 ]
 
 SOURCES = [
+    "https://gist.github.com/dekinikis-tech/066c60c512b71c90a07613e8663a720c/raw/vps.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS+All_RUS.txt",
@@ -65,11 +66,6 @@ SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
 ]
 
-# Доверенные источники — пропускают TCP и xray проверку, но проходят
-# все фильтры безопасности (FILTER_INSECURE, FILTER_LOCK и т.д.)
-TRUSTED_SOURCES = [
-    "https://gist.github.com/dekinikis-tech/066c60c512b71c90a07613e8663a720c/raw/vps.txt",
-]
 
 BLACK_LIST = [
     'meshky', '4mohsen', 'white', '708087',
@@ -922,11 +918,9 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0):
 
 
 def fetch_configs():
-    all_raw     = []
-    trusted_raw = []
-    ru_keys     = set()
+    all_raw = []
+    ru_keys = set()
 
-    # Обычные источники — идут через TCP + xray
     for source_url in SOURCES:
         raw_text = _fetch_with_retry(source_url)
         if raw_text is None:
@@ -937,18 +931,6 @@ def fetch_configs():
         print(f"  [OK] {source_url}  ->  {len(found)} конфигов  [{fmt}]")
         all_raw.extend(found)
 
-    # Доверенные источники — пропускают xray, но проходят все фильтры
-    for source_url in TRUSTED_SOURCES:
-        raw_text = _fetch_with_retry(source_url)
-        if raw_text is None:
-            continue
-        text  = _decode_subscription(raw_text)
-        found = PROTO_REGEX.findall(text)
-        fmt   = "plain" if text is raw_text else "base64"
-        print(f"  [TRUSTED] {source_url}  ->  {len(found)} конфигов  [{fmt}]")
-        trusted_raw.extend(found)
-
-    # Дедупликация обычных конфигов
     seen_endpoints = set()
     unique = []
     for cfg in all_raw:
@@ -963,19 +945,7 @@ def fetch_configs():
         else:
             unique.append(cfg)
 
-    # Дедупликация доверенных (исключаем дубли с обычными)
-    unique_trusted = []
-    for cfg in trusted_raw:
-        host, port = _extract_host_port(cfg)
-        if host and port:
-            key = f"{host}:{port}"
-            if key not in seen_endpoints:
-                seen_endpoints.add(key)
-                unique_trusted.append(cfg)
-        else:
-            unique_trusted.append(cfg)
-
-    return unique, unique_trusted, ru_keys
+    return unique, ru_keys
 
 
 # ============================================================
@@ -1193,11 +1163,9 @@ def run():
     _init_geoip()
 
     print("\n[1/4] Сбор конфигов...")
-    all_configs, trusted_configs, ru_source_keys = fetch_configs()
+    all_configs, ru_source_keys = fetch_configs()
     print(f"      Итого уникальных (по хосту:порту): {len(all_configs)}")
-    if trusted_configs:
-        print(f"      Доверенных (пропускают xray): {len(trusted_configs)}")
-    if not all_configs and not trusted_configs:
+    if not all_configs:
         print("Нет кандидатов.")
         return
 
@@ -1231,24 +1199,6 @@ def run():
             if res:
                 results.append(res)
 
-    # Доверенные конфиги: делаем TCP-проверку чтобы отсеять мёртвые,
-    # но пропускаем xray. Пинг ставим 9999 — они встанут в конец списка.
-    # Все фильтры безопасности применятся на следующем этапе как обычно.
-    if trusted_configs:
-        print(f"  TCP-проверка {len(trusted_configs)} доверенных конфигов...")
-        trusted_alive = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
-            for future in concurrent.futures.as_completed(
-                {ex.submit(tcp_alive, u): u for u in trusted_configs}
-            ):
-                res = future.result()
-                if res:
-                    trusted_alive.append(res)
-        print(f"  Доверенных живых: {len(trusted_alive)} / {len(trusted_configs)}")
-        for url in trusted_alive:
-            results.append((url, 9999, 9999, 0, 0))
-
-    elapsed_total = int(time.time() - t_start)
 
     print(f"\n[4/4] Сохранение...")
     if not results:
