@@ -66,18 +66,6 @@ SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
 ]
 
-
-BLACK_LIST = [
-    'meshky', '4mohsen', 'white', '708087',
-    'oneclick', '4jadi', '4kian', 'yandex.net', 'vk-apps.com',
-]
-
-BLOCKED_IPS = (
-    '104.', '172.64.', '172.65.', '172.66.', '172.67.',
-    '188.114.', '162.159.', '108.162.', '158.160.',
-    '51.250.', '84.201.',
-)
-
 VLESS_REGEX = re.compile(
     r"vless://(?P<uuid>[^@]+)@(?P<host>[^:?#]+):(?P<port>\d+)\??(?P<query>[^#]+)?#?(?P<n>.*)?"
 )
