@@ -10,7 +10,7 @@ FILE_NAME   = "vps.txt"
 SUB_FILE    = "sub.txt"
 VIEWER_FILE = "index.html"
 XRAY_BIN    = "xray"
-TOP_N_EACH  = 200
+TOP_N_EACH  = 900
 
 # Путь к базе GeoLite2 (скачивается в workflow)
 GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
@@ -56,7 +56,7 @@ TEST_URLS = [
 ]
 
 SOURCES = [
-    "https://gist.github.com/dekinikis-tech/066c60c512b71c90a07613e8663a720c/raw/vps.txt", #Добавить t чтобы работала ссылка 
+    "https://gist.github.com/dekinikis-tech/066c60c512b71c90a07613e8663a720c/raw/vps.tx", #Добавить t чтобы работала ссылка 
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS+All_RUS.txt",
