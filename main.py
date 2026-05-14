@@ -10,7 +10,7 @@ FILE_NAME   = "vps.txt"
 SUB_FILE    = "sub.txt"
 VIEWER_FILE = "index.html"
 XRAY_BIN    = "xray"
-TOP_N_EACH  = 900
+TOP_N_EACH  = 200
 
 # Путь к базе GeoLite2 (скачивается в workflow)
 GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
