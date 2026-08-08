@@ -56,7 +56,7 @@ TEST_URLS = [
 ]
 
 SOURCES = [
-    "https://gist.github.com/dekinikis-tech/066c60c512b71c90a07613e8663a720c/raw/vps.tx", #Добавить t чтобы работала ссылка 
+    "https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt", #Добавить t чтобы работала ссылка 
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS+All_RUS.txt",
