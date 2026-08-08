@@ -56,16 +56,24 @@ TEST_URLS = [
 ]
 
 SOURCES = [
-    "https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt", #Добавить t чтобы работала ссылка 
+    # Проверено вручную 08.08.2026: все ссылки ниже отдают контент,
+    # обновляются ежедневно (profile-update-interval: 1).
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS+All_RUS.txt",
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS%2BAll_RUS.txt",
+    # Рабочий, но содержит много почти дублирующих мусорных конфигов
+    # на одни и те же домены (hentai-cdn.apruxdomain.xyz и т.п.).
+    # xray-проверка их и так отсеет, но грузится и парсится дольше.
+    # Уберите строку ниже, если не нужно.
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt",
 ]
+# Убрано: AvenCores/goida-vpn-configs/.../26.txt — недоступен (сайт блокирует
+# автоматический доступ), и в коде уже была пометка, что ссылка битая.
+# Убрано: BLACK_SS%2BAll_RUS.txt — это дубликат BLACK_SS+All_RUS.txt
+# (тот же файл, просто URL-кодированный "+"), только задваивал загрузку.
 
 
 BLACK_LIST = [
@@ -228,7 +236,9 @@ def _check_pbk(url: str) -> bool:
     return True
 
 
+import threading
 _sni_cache: dict = {}
+_sni_lock = threading.Lock()
 
 def _check_sni(url: str) -> bool:
     """
@@ -241,8 +251,9 @@ def _check_sni(url: str) -> bool:
     sni = urllib.parse.unquote(m.group(1)).strip().lower()
     if not sni:
         return True
-    if sni in _sni_cache:
-        return _sni_cache[sni]
+    with _sni_lock:
+        if sni in _sni_cache:
+            return _sni_cache[sni]
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = True
@@ -250,16 +261,16 @@ def _check_sni(url: str) -> bool:
         raw = socket.create_connection((sni, 443), timeout=SNI_CHECK_TIMEOUT)
         tls = ctx.wrap_socket(raw, server_hostname=sni)
         tls.close()
-        _sni_cache[sni] = True
-        return True
+        result = True
     except ssl.SSLCertVerificationError:
         # Порт открыт, но сертификат не тот — именно это мы и хотели поймать
-        _sni_cache[sni] = False
-        return False
+        result = False
     except Exception:
         # Таймаут, connection refused и т.д. — SNI мёртв
-        _sni_cache[sni] = False
-        return False
+        result = False
+    with _sni_lock:
+        _sni_cache[sni] = result
+    return result
 
 
 # ============================================================
@@ -752,6 +763,85 @@ def _build_xray_config_trojan(url: str, port: int):
     }
 
 
+def _parse_ss_url(url: str):
+    """
+    Разбирает ss:// в формате SIP002 (ss://base64(method:password)@host:port#tag)
+    или legacy (ss://base64(method:password@host:port)#tag).
+    Возвращает dict {method, password, host, port} или None.
+    """
+    body = url[len('ss://'):]
+    if '#' in body:
+        body = body.split('#', 1)[0]
+
+    def _b64decode(s: str):
+        padded = s + '=' * ((-len(s)) % 4)
+        for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+            try:
+                return decoder(padded).decode('utf-8')
+            except Exception:
+                continue
+        return None
+
+    if '@' in body:
+        userinfo, hostport = body.split('@', 1)
+        hostport = hostport.split('/')[0].split('?')[0]
+        if ':' not in userinfo:
+            decoded = _b64decode(userinfo)
+            if decoded is None or ':' not in decoded:
+                return None
+            userinfo = decoded
+        if ':' not in hostport:
+            return None
+        method, password = userinfo.split(':', 1)
+        host, _, port_s = hostport.rpartition(':')
+    else:
+        decoded = _b64decode(body)
+        if decoded is None or '@' not in decoded:
+            return None
+        userinfo, hostport = decoded.split('@', 1)
+        if ':' not in userinfo or ':' not in hostport:
+            return None
+        method, password = userinfo.split(':', 1)
+        host, _, port_s = hostport.rpartition(':')
+
+    try:
+        port = int(port_s)
+    except (ValueError, TypeError):
+        return None
+    if not host:
+        return None
+    return {'method': method, 'password': password, 'host': host.strip('[]'), 'port': port}
+
+
+def _build_xray_config_ss(url: str, port: int):
+    data = _parse_ss_url(url)
+    if not data:
+        return None
+    return {
+        "log": {"loglevel": "none"},
+        "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "http"}],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [{
+                        "address":  data['host'],
+                        "port":     data['port'],
+                        "method":   data['method'],
+                        "password": data['password'],
+                    }]
+                },
+            },
+            {"tag": "block", "protocol": "blackhole"}
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [{"type": "field", "outboundTag": "proxy", "network": "tcp,udp"}]
+        }
+    }
+
+
 def _check_google_ban(session: requests.Session) -> bool:
     """
     Проверяет не заблокирован ли сервер Google-ом (captcha/sorry).
@@ -794,8 +884,16 @@ def test_via_xray(url: str):
             config = _build_xray_config_trojan(url, port)
             if config is None:
                 return None
+        elif url.startswith('ss://'):
+            config = _build_xray_config_ss(url, port)
+            if config is None:
+                return None
         else:
-            return (url, 9999, 9999, 0, 0)
+            # hysteria2 и прочие протоколы, для которых нет билдера конфига,
+            # реально не проверяются xray-ом — раньше они молча "проходили"
+            # с фейковым пингом 9999мс. Честнее и безопаснее их отбросить,
+            # чем публиковать непроверенный сервер как рабочий.
+            return None
 
         with open(cfg_file, "w") as f:
             json.dump(config, f)
@@ -1405,4 +1503,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-#fack
