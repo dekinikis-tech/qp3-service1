@@ -43,6 +43,8 @@ on, off = True, False
 GID         = os.environ.get('MY_GIST_ID')
 FILE_NAME   = "vps.txt"
 SUB_FILE    = "sub.txt"
+RU_FILE     = "vps_ru.txt"
+RU_SUB_FILE = "sub_ru.txt"
 VIEWER_FILE = "index.html"
 XRAY_BIN    = os.environ.get('XRAY_BIN', 'xray')
 TOP_N_EACH  = 900
@@ -53,7 +55,15 @@ FILTER_INSECURE    = on    # скрыть ⚠️ небезопасные (не�
 FILTER_LOCK        = off   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
 FILTER_RUSSIAN     = off   # скрыть 🇷🇺 российские серверы
 FILTER_INVALID_PBK = on    # скрыть Reality с битым pbk/sid
-FILTER_MITM        = on    # NEW: скрыть серверы, подменяющие HTTPS-сертификаты
+FILTER_MITM        = on    # скрыть серверы, подменяющие HTTPS-сертификаты
+REQUIRE_HTTPS      = on    # NEW: сервер обязан пройти HTTPS-проверку (как тест в v2rayNG);
+                           # раньше хватало голого HTTP, и «полуживые» серверы попадали в список
+NAME_SHOW_SECURITY = on    # NEW: иконка защиты в начале имени (🔑 Reality / 🔒 TLS / ⚠️)
+NAME_NUMBERING     = on    # NEW: «Germany #1, #2…» (нумерация по пингу внутри группы)
+WHITELIST_LABEL    = "Белые списки"
+# Источники, чьё имя файла содержит одну из подстрок, считаются «белыми списками»
+WHITELIST_SOURCE_MARKERS = ('white', 'bypass', 'whitelist', 'ru-sni')
+PUBLISH_RU_FILES   = on    # NEW: отдельная подписка с российскими серверами (vps_ru.txt / sub_ru.txt)
 # Проверка «жив ли сайт из SNI» с GitHub-раннера (США) даёт ложные отказы для
 # российских SNI (vk.com, max.ru ...) — они гео-блокируют зарубежные IP.
 # Для Reality клиент вообще не ходит на этот сайт, поэтому по умолчанию выключено.
@@ -307,6 +317,99 @@ def _is_russian_server(host: str, url: str = '') -> bool:
         if sni and any(k in sni for k in RU_SNI_KEYWORDS):
             return True
     return False
+
+
+# ============================================================
+# ИМЕНА СЕРВЕРОВ: флаг + страна (+ «Белые списки»)
+# ============================================================
+COUNTRY_NAMES = {
+    'AE': 'United Arab Emirates', 'AL': 'Albania', 'AM': 'Armenia', 'AR': 'Argentina',
+    'AT': 'Austria', 'AU': 'Australia', 'AZ': 'Azerbaijan', 'BA': 'Bosnia and Herzegovina',
+    'BD': 'Bangladesh', 'BE': 'Belgium', 'BG': 'Bulgaria', 'BH': 'Bahrain', 'BR': 'Brazil',
+    'BY': 'Belarus', 'CA': 'Canada', 'CH': 'Switzerland', 'CL': 'Chile', 'CN': 'China',
+    'CO': 'Colombia', 'CR': 'Costa Rica', 'CY': 'Cyprus', 'CZ': 'Czechia', 'DE': 'Germany',
+    'DK': 'Denmark', 'EC': 'Ecuador', 'EE': 'Estonia', 'EG': 'Egypt', 'ES': 'Spain',
+    'FI': 'Finland', 'FR': 'France', 'GB': 'United Kingdom', 'GE': 'Georgia', 'GR': 'Greece',
+    'HK': 'Hong Kong', 'HR': 'Croatia', 'HU': 'Hungary', 'ID': 'Indonesia', 'IE': 'Ireland',
+    'IL': 'Israel', 'IN': 'India', 'IR': 'Iran', 'IS': 'Iceland', 'IT': 'Italy',
+    'JP': 'Japan', 'KG': 'Kyrgyzstan', 'KR': 'South Korea', 'KZ': 'Kazakhstan',
+    'LT': 'Lithuania', 'LU': 'Luxembourg', 'LV': 'Latvia', 'MD': 'Moldova', 'ME': 'Montenegro',
+    'MK': 'North Macedonia', 'MT': 'Malta', 'MX': 'Mexico', 'MY': 'Malaysia',
+    'NL': 'Netherlands', 'NO': 'Norway', 'NZ': 'New Zealand', 'PA': 'Panama', 'PE': 'Peru',
+    'PH': 'Philippines', 'PK': 'Pakistan', 'PL': 'Poland', 'PT': 'Portugal', 'RO': 'Romania',
+    'RS': 'Serbia', 'RU': 'Russia', 'SA': 'Saudi Arabia', 'SE': 'Sweden', 'SG': 'Singapore',
+    'SI': 'Slovenia', 'SK': 'Slovakia', 'TH': 'Thailand', 'TR': 'Turkey', 'TW': 'Taiwan',
+    'UA': 'Ukraine', 'US': 'United States', 'UZ': 'Uzbekistan', 'VN': 'Vietnam',
+    'ZA': 'South Africa',
+}
+_FLAG_RE   = re.compile('[\U0001F1E6-\U0001F1FF]{2}')
+_WL_TAG_RE = re.compile(r'cidr|white|белы[ех]\s+списк|\bwl\b', re.I)
+_WL_KEYS: set = set()      # ключи серверов, пришедших из «белых» источников
+_NAMES: dict = {}          # url -> итоговое имя
+
+
+def _is_whitelist_source(src_url: str) -> bool:
+    base = src_url.rsplit('/', 1)[-1].lower()
+    return any(m in base for m in WHITELIST_SOURCE_MARKERS)
+
+
+def _iso_to_flag(code: str) -> str:
+    return ''.join(chr(0x1F1E6 + ord(c) - 65) for c in code.upper())
+
+
+def _flag_to_iso(flag: str) -> str:
+    return ''.join(chr(ord(c) - 0x1F1E6 + 65) for c in flag)
+
+
+def _geoip_country(ip: str):
+    if _geoip_reader is None:
+        return None
+    try:
+        r = _geoip_reader.country(ip)
+        return (r.country.iso_code, r.country.names.get('en')) if r.country.iso_code else None
+    except Exception:
+        return None
+
+
+def _is_whitelist(url: str) -> bool:
+    p = parse_link(url)
+    if not p:
+        return False
+    return _dedup_key(p) in _WL_KEYS or bool(_WL_TAG_RE.search(p['tag']))
+
+
+def _country_for(url: str, wl: bool) -> tuple:
+    """(ISO-код, английское название). GeoIP по реальному IP; для «белых списков»
+    приоритет у флага в исходном теге: там обычно страна выхода, а IP входа — российский."""
+    p = parse_link(url)
+    host = p['host'].lower()
+    ip = host if _is_ip_literal(host) else _RESOLVED.get(host)
+    geo = _geoip_country(ip) if ip else None
+    geo_code = geo[0] if geo else None
+    tag_codes = list(dict.fromkeys(_flag_to_iso(f) for f in _FLAG_RE.findall(p['tag'])))
+    tag_code = tag_codes[0] if len(tag_codes) == 1 else None
+    code = (tag_code or geo_code) if wl else (geo_code or tag_code)
+    if not code:
+        return '', 'Unknown'
+    name = COUNTRY_NAMES.get(code) or (geo[1] if geo and geo[0] == code else None) or code
+    return code, name
+
+
+def _assign_names(results: list):
+    """Формирует имена: «🔑 🇩🇪 Germany #1» / «🔑 🇵🇱 Белые списки | Poland #1»."""
+    counters: dict = {}
+    for entry in results:
+        url = entry[0]
+        wl = _is_whitelist(url)
+        code, cname = _country_for(url, wl)
+        flag = _iso_to_flag(code) if code else '\U0001f310'
+        name = f"{flag} {WHITELIST_LABEL} | {cname}" if wl else f"{flag} {cname}"
+        if NAME_NUMBERING:
+            n = counters[(wl, code)] = counters.get((wl, code), 0) + 1
+            name += f" #{n}"
+        if NAME_SHOW_SECURITY:
+            name = f"{_get_security_level(url)[1]} {name}"
+        _NAMES[url] = name
 
 
 # ============================================================
@@ -647,8 +750,10 @@ def _measure(port: int):
     try:
         if CHECK_GOOGLE_BAN and not _check_google_ban(session):
             return None
-        if FILTER_MITM and _tls_integrity(session) is False:
-            return None
+        if FILTER_MITM or REQUIRE_HTTPS:
+            ok = _tls_integrity(session)
+            if (FILTER_MITM and ok is False) or (REQUIRE_HTTPS and ok is not True):
+                return None
 
         pings, losses = [], 0
         for _ in range(PING_ROUNDS):
@@ -763,6 +868,22 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0):
     return None
 
 
+def _dedup_key(p: dict) -> tuple:
+    """Ключ «один и тот же сервер». Варианты fp (chrome/edge/ios/qq...) и мусорные
+    параметры (host=?TELEGRAM..., headerType=) — это ОДИН сервер, не разные."""
+    if p['proto'] == 'ss':
+        return ('ss', p['host'].lower(), p['port'], p['method'], p['password'])
+    q = p['q']
+    net = (q.get('type') or 'tcp').lower()
+    net = {'raw': 'tcp', 'h2': 'http', 'splithttp': 'xhttp'}.get(net, net)
+    keys = ['security', 'sni', 'pbk', 'sid', 'flow', 'encryption', 'alpn',
+            'allowInsecure', 'insecure']
+    if net != 'tcp':
+        keys += ['path', 'host', 'serviceName', 'mode', 'extra', 'authority', 'seed', 'headerType']
+    return (p['proto'], p['host'].lower(), p['port'], p['secret'], net,
+            tuple((k, q.get(k, '')) for k in keys))
+
+
 def fetch_configs() -> list:
     with cf.ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
         texts = list(ex.map(_fetch_with_retry, SOURCES))
@@ -775,17 +896,20 @@ def fetch_configs() -> list:
         found = PROTO_REGEX.findall(text)
         fmt = "plain" if text == raw.strip() else "base64"
         print(f"  [OK] {src.rsplit('/', 1)[-1]}  ->  {len(found)}  [{fmt}]")
-        all_raw.extend(found)
+        wl = _is_whitelist_source(src)
+        all_raw.extend((c, wl) for c in found)
 
-    seen_full, per_endpoint, unique = set(), {}, []
-    for cfg in all_raw:
-        key = cfg.split('#', 1)[0]
-        if key in seen_full:
-            continue
-        seen_full.add(key)
+    seen_keys, per_endpoint, unique = set(), {}, []
+    for cfg, wl in all_raw:
         p = parse_link(cfg)
         if not p:
             continue
+        key = _dedup_key(p)
+        if wl:
+            _WL_KEYS.add(key)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         ep = f"{p['host'].lower()}:{p['port']}"
         if per_endpoint.get(ep, 0) >= MAX_PER_ENDPOINT:
             continue
@@ -956,8 +1080,7 @@ def generate_html_viewer(intl_results: list, ru_results: list, elapsed: int) -> 
         for i, (url, _score, avg, jitter, losses) in enumerate(results, 1):
             p = parse_link(url) or {'proto': '?', 'host': '', 'tag': '', 'q': {}}
             host = p['host']
-            tag = (p['tag'] or host)[:40]
-            flag = '\U0001f1f7\U0001f1fa' if _is_russian_server(host, url) else '\U0001f30d'
+            tag = _NAMES.get(url) or (p['tag'] or host)[:40]
             loss_pct = int(losses / PING_ROUNDS * 100)
             level, icon, tip = _get_security_level(url)
             sec = _get_security(p) if p['proto'] != '?' else '?'
@@ -965,7 +1088,7 @@ def generate_html_viewer(intl_results: list, ru_results: list, elapsed: int) -> 
             rows.append(
                 '<tr style="border-bottom:1px solid #1e2230">'
                 f'<td style="padding:9px 10px;color:#4a5568">{i}</td>'
-                f'<td style="padding:9px 10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{flag} {_esc(tag)}</td>'
+                f'<td style="padding:9px 10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(tag)}</td>'
                 f'<td style="padding:9px 10px"><span style="background:#0d2b33;color:#00e5ff;border:1px solid #005f6b;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">{_esc(p["proto"].upper())}</span></td>'
                 f'<td style="padding:9px 10px"><span style="{badge}">{_esc(net)}</span></td>'
                 f'<td style="padding:9px 10px"><span style="{badge}">{_esc(sec)}</span></td>'
@@ -1000,12 +1123,24 @@ def generate_html_viewer(intl_results: list, ru_results: list, elapsed: int) -> 
 # ============================================================
 
 def _tagged_url(url: str) -> str:
-    """Подписывает конфиг иконкой безопасности; тег корректно percent-кодируется."""
+    """Подписывает конфиг красивым именем; фрагмент корректно percent-кодируется."""
     p = parse_link(url)
-    _, icon, _ = _get_security_level(url)
-    base = url.split('#', 1)[0]
-    name = ((p['tag'] if p and p['tag'] else f"{p['host']}:{p['port']}") if p else '')[:38]
-    return f"{base}#{urllib.parse.quote(f'{icon} {name}')}"
+    name = _NAMES.get(url)
+    if not name:
+        name = f"{p['host']}:{p['port']}" if p else 'server'
+    return f"{url.split('#', 1)[0]}#{urllib.parse.quote(name)}"
+
+
+def _print_breakdown(results: list):
+    from collections import Counter
+    c = Counter()
+    for r in results:
+        p = parse_link(r[0])
+        if p:
+            c[(p['proto'], _get_security(p), _get_network(p))] += 1
+    print("  Структура финала (протокол / security / транспорт):")
+    for (a, b, n), k in c.most_common():
+        print(f"    {a}/{b}/{n}: {k}")
 
 
 def _update_gist(files: dict):
@@ -1056,7 +1191,7 @@ def run():
 
     print("\n[1/5] Сбор конфигов...")
     configs = fetch_configs()
-    print(f"      Уникальных (до {MAX_PER_ENDPOINT} вариантов на host:port): {len(configs)}")
+    print(f"      Уникальных серверов (без дублей по fp; до {MAX_PER_ENDPOINT} вариантов на host:port): {len(configs)}")
     if not configs:
         print("Нет кандидатов.")
         return
@@ -1126,6 +1261,8 @@ def run():
 
     intl_results = sorted(intl_pool, key=lambda x: x[1])[:TOP_N_EACH]
     ru_results   = sorted(ru_pool,   key=lambda x: x[1])[:TOP_N_EACH]
+    _assign_names(intl_results)
+    _assign_names(ru_results)
     elapsed = int(time.time() - t_start)
 
     print(f"\n{'─' * 60}")
@@ -1134,7 +1271,9 @@ def run():
     for i, (url, _s, avg, jitter, losses) in enumerate(intl_results[:10], 1):
         p = parse_link(url)
         print(f"  {i:<3}{avg:>5}мс  jitter:{jitter:>4}  loss:{losses}/{PING_ROUNDS}  "
-              f"{_get_security_level(url)[1]} {(p['tag'] or p['host'])[:40]}")
+              f"{_NAMES.get(url, p['host'])}")
+
+    _print_breakdown(intl_results + ru_results)
 
     if not intl_results:
         print("Зарубежных серверов после фильтров нет — файлы не перезаписываются.")
@@ -1144,14 +1283,19 @@ def run():
     sub_text = base64.b64encode(vps_text.encode("utf-8")).decode("ascii")
     html_text = generate_html_viewer(intl_results, ru_results, elapsed)
 
-    for name, content in ((FILE_NAME, vps_text), (SUB_FILE, sub_text), (VIEWER_FILE, html_text)):
+    files = {FILE_NAME: vps_text, SUB_FILE: sub_text, VIEWER_FILE: html_text}
+    if PUBLISH_RU_FILES and ru_results:
+        ru_text = "\n".join(_tagged_url(r[0]) for r in ru_results)
+        files[RU_FILE] = ru_text
+        files[RU_SUB_FILE] = base64.b64encode(ru_text.encode("utf-8")).decode("ascii")
+    for name, content in files.items():
         with open(name, "w", encoding="utf-8") as f:
             f.write(content)
     print(f"\n Сохранено: {FILE_NAME} ({len(intl_results)}), {SUB_FILE}, {VIEWER_FILE}")
 
     if GID:
         print("Обновляем Gist...")
-        _update_gist({FILE_NAME: vps_text, SUB_FILE: sub_text, VIEWER_FILE: html_text})
+        _update_gist(files)
     else:
         print("  MY_GIST_ID не задан.")
 
