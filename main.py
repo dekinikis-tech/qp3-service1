@@ -61,8 +61,10 @@ REQUIRE_HTTPS      = on    # NEW: сервер обязан пройти HTTPS-�
 NAME_SHOW_SECURITY = on    # NEW: иконка защиты в начале имени (🔑 Reality / 🔒 TLS / ⚠️)
 NAME_NUMBERING     = on    # NEW: «Germany #1, #2…» (нумерация по пингу внутри группы)
 WHITELIST_LABEL    = "Белые списки"
-# Источники, чьё имя файла содержит одну из подстрок, считаются «белыми списками»
-WHITELIST_SOURCE_MARKERS = ('white', 'bypass', 'whitelist', 'ru-sni')
+# «Белыми» считаются ТОЛЬКО файлы igareck с этой подстрокой в имени (WHITE-CIDR…, WHITE-SNI…).
+# Сторонние агрегаторы (rjsxrd, vless-parser) намеренно НЕ учитываются: они тянут в свои
+# «whitelist»-файлы почти всё подряд, включая обычные чёрные списки.
+WHITELIST_SOURCE_MARKERS = ('white',)
 PUBLISH_RU_FILES   = on    # NEW: отдельная подписка с российскими серверами (vps_ru.txt / sub_ru.txt)
 # Проверка «жив ли сайт из SNI» с GitHub-раннера (США) даёт ложные отказы для
 # российских SNI (vk.com, max.ru ...) — они гео-блокируют зарубежные IP.
@@ -349,6 +351,8 @@ _NAMES: dict = {}          # url -> итоговое имя
 
 
 def _is_whitelist_source(src_url: str) -> bool:
+    if not src_url.startswith(_IGARECK):
+        return False
     base = src_url.rsplit('/', 1)[-1].lower()
     return any(m in base for m in WHITELIST_SOURCE_MARKERS)
 
@@ -395,9 +399,10 @@ def _country_for(url: str, wl: bool) -> tuple:
     return code, name
 
 
-def _assign_names(results: list):
+def _assign_names(results: list) -> int:
     """Формирует имена: «🔑 🇩🇪 Germany #1» / «🔑 🇵🇱 Белые списки | Poland #1»."""
     counters: dict = {}
+    wl_count = 0
     for entry in results:
         url = entry[0]
         wl = _is_whitelist(url)
@@ -410,6 +415,8 @@ def _assign_names(results: list):
         if NAME_SHOW_SECURITY:
             name = f"{_get_security_level(url)[1]} {name}"
         _NAMES[url] = name
+        wl_count += wl
+    return wl_count
 
 
 # ============================================================
@@ -1261,8 +1268,10 @@ def run():
 
     intl_results = sorted(intl_pool, key=lambda x: x[1])[:TOP_N_EACH]
     ru_results   = sorted(ru_pool,   key=lambda x: x[1])[:TOP_N_EACH]
-    _assign_names(intl_results)
-    _assign_names(ru_results)
+    wl_i = _assign_names(intl_results)
+    wl_r = _assign_names(ru_results)
+    print(f"  Помечено «{WHITELIST_LABEL}»: {wl_i} из {len(intl_results)} зарубежных, "
+          f"{wl_r} из {len(ru_results)} российских")
     elapsed = int(time.time() - t_start)
 
     print(f"\n{'─' * 60}")
