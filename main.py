@@ -52,8 +52,8 @@ GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
 
 # --- Фильтры ---
 FILTER_INSECURE    = on    # скрыть ⚠️ небезопасные (нет шифрования / allowInsecure=1)
-FILTER_LOCK        = off   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
-FILTER_RUSSIAN     = off   # скрыть 🇷🇺 российские серверы
+FILTER_LOCK        = on   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
+FILTER_RUSSIAN     = on   # скрыть 🇷🇺 российские серверы
 FILTER_INVALID_PBK = on    # скрыть Reality с битым pbk/sid
 FILTER_MITM        = on    # скрыть серверы, подменяющие HTTPS-сертификаты
 REQUIRE_HTTPS      = on    # NEW: сервер обязан пройти HTTPS-проверку (как тест в v2rayNG);
