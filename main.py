@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VPN Scout 2.0
+VPN Scout 3.0
 
 Собирает публичные VLESS / Trojan / Shadowsocks конфиги, проверяет их через
 xray и публикует результат (vps.txt, sub.txt, index.html) в GitHub Gist.
@@ -11,10 +11,12 @@ xray и публикует результат (vps.txt, sub.txt, index.html) в 
 from __future__ import annotations
 
 import base64
+import collections
 import concurrent.futures as cf
 import contextlib
 import functools
-import html as html_lib
+import hashlib
+import bisect
 import ipaddress
 import json
 import os
@@ -45,26 +47,45 @@ FILE_NAME   = "vps.txt"
 SUB_FILE    = "sub.txt"
 RU_FILE     = "vps_ru.txt"
 RU_SUB_FILE = "sub_ru.txt"
-VIEWER_FILE = "index.html"
+OBSOLETE_GIST_FILES = ("index.html",)   # старый HTML-просмотрщик: удаляется из Gist
 XRAY_BIN    = os.environ.get('XRAY_BIN', 'xray')
 TOP_N_EACH  = 900
 GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
 
 # --- Фильтры ---
 FILTER_INSECURE    = on    # скрыть ⚠️ небезопасные (нет шифрования / allowInsecure=1)
-FILTER_LOCK        = on   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
-FILTER_RUSSIAN     = on   # скрыть 🇷🇺 российские серверы
+FILTER_LOCK        = off   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
+FILTER_RUSSIAN     = off   # скрыть 🇷🇺 российские серверы
 FILTER_INVALID_PBK = on    # скрыть Reality с битым pbk/sid
 FILTER_MITM        = on    # скрыть серверы, подменяющие HTTPS-сертификаты
-REQUIRE_HTTPS      = on    # NEW: сервер обязан пройти HTTPS-проверку (как тест в v2rayNG);
-                           # раньше хватало голого HTTP, и «полуживые» серверы попадали в список
 NAME_SHOW_SECURITY = on    # NEW: иконка защиты в начале имени (🔑 Reality / 🔒 TLS / ⚠️)
 NAME_NUMBERING     = on    # NEW: «Germany #1, #2…» (нумерация по пингу внутри группы)
 WHITELIST_LABEL    = "Белые списки"
-# «Белыми» считаются ТОЛЬКО файлы igareck с этой подстрокой в имени (WHITE-CIDR…, WHITE-SNI…).
-# Сторонние агрегаторы (rjsxrd, vless-parser) намеренно НЕ учитываются: они тянут в свои
-# «whitelist»-файлы почти всё подряд, включая обычные чёрные списки.
-WHITELIST_SOURCE_MARKERS = ('white',)
+
+# ---------------------------------------------------------------------------
+# БЕЛЫЕ СПИСКИ: определяет сам код, а не подписи в источниках
+# ---------------------------------------------------------------------------
+WL_DETECT = on
+# 'both' — IP сервера в белом списке подсетей И SNI в белом списке доменов
+#          (операторы переходят именно на такую связку: одного правильного SNI мало,
+#           если IP сервера не в списке); 'ip' | 'sni' | 'any' — мягче.
+WL_RULE = 'both'
+WL_IP_LISTS = [      # подсети, доступные в мобильных сетях РФ при белых списках
+    "https://raw.githubusercontent.com/ancored/ru-mobile-whitelist/release/ru-mobile-whitelist-ip.txt",
+    "https://cdn.jsdelivr.net/gh/hxehex/russia-mobile-internet-whitelist/cidrwhitelist.txt",
+    "https://raw.githubusercontent.com/escapingworm/russia-whitelist/refs/heads/main/ru-whitelist-cidr.txt",
+    "https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip/release/text/whitelist.txt",
+]
+WL_SNI_LISTS = [     # домены (SNI), которые пропускает фильтр
+    "https://raw.githubusercontent.com/ancored/ru-mobile-whitelist/release/ru-mobile-whitelist-sni.txt",
+    "https://cdn.jsdelivr.net/gh/hxehex/russia-mobile-internet-whitelist/whitelist.txt",
+]
+# Ваши собственные подтверждённые серверы: вставьте в этот файл Gist список ссылок,
+# которые реально работали у вас при включённых белых списках (экспорт из клиента).
+WL_GOOD_FILE = "whitelist_good.txt"
+# Если ЭТОТ скрипт запущен внутри сети с белыми списками (например, на телефоне в Termux),
+# он сам это обнаружит: напрямую доступны российские сайты, а зарубежные — нет.
+RU_CONTROL_URLS = ["https://ya.ru/", "https://vk.com/"]
 PUBLISH_RU_FILES   = on    # NEW: отдельная подписка с российскими серверами (vps_ru.txt / sub_ru.txt)
 # Проверка «жив ли сайт из SNI» с GitHub-раннера (США) даёт ложные отказы для
 # российских SNI (vk.com, max.ru ...) — они гео-блокируют зарубежные IP.
@@ -95,15 +116,36 @@ REQUEST_TIMEOUT    = 12.0 if _slow else 7.0
 XRAY_START_TIMEOUT = 5.0  if _slow else 3.5
 XRAY_PORT_BASE     = 25000
 
-TEST_URLS = [
-    "http://www.instagram.com/",
-    "http://www.facebook.com/",
-    "http://www.gstatic.com/generate_204",
-    "http://cp.cloudflare.com/",
+# ---------------------------------------------------------------------------
+# НАДЁЖНОСТЬ ПРОВЕРКИ (v3)
+# ---------------------------------------------------------------------------
+# Пинг и потери меряются ТОЛЬКО по HTTPS с проверкой сертификата (как реальный тест
+# в v2rayNG/Happ). Голый HTTP больше не засчитывается.
+HTTPS_TARGETS = [
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
 ]
-# HTTPS с проверкой сертификата: ловит MITM и серверы, подсовывающие заглушки.
-INTEGRITY_URL = "https://www.gstatic.com/generate_204"
-OK_STATUS     = {200, 204, 301, 302, 308}
+HIJACK_CHECK    = on       # прокси, «отвечающий» на несуществующий домен, — заглушка/перехват DNS
+DATA_TEST       = on       # реальная передача данных, а не только ответ 204
+DATA_TEST_BYTES = 300_000
+DATA_TEST_URL   = f"https://speed.cloudflare.com/__down?bytes={DATA_TEST_BYTES}"
+DATA_TEST_MAX_SEC = 15.0
+MIN_KBPS        = 40       # минимальная скорость в тесте передачи данных, КБ/с
+
+PROBE_HANDSHAKE      = on  # прямое TLS/Reality-рукопожатие с сервером ДО xray
+PROBE_TIMEOUT        = 4.0
+PROBE_RETRIES        = 2
+PROBE_STRICT_TLS     = on  # TLS/Trojan: битый/просроченный сертификат = отсев
+PROBE_STRICT_REALITY = off # Reality: пока только статистика (см. лог), включите после калибровки
+
+CONFIRM_PASS    = on       # повторная проверка выживших через CONFIRM_DELAY секунд
+CONFIRM_DELAY   = 15
+
+HISTORY_FILE         = "history.json"   # хранится в Gist рядом с подпиской
+HISTORY_RUNS         = 12               # сколько последних запусков помнить
+HISTORY_MAX_AGE_DAYS = 14
+MIN_HISTORY_RUNS     = 3                # с какого числа запусков включается фильтр по аптайму
+MIN_UPTIME           = 0.5              # ниже — сервер «мигает» и не публикуется
 
 SUPPORTED_PROTOS = ('vless', 'trojan', 'ss')   # hysteria2 xray-ом не проверить
 
@@ -345,16 +387,7 @@ COUNTRY_NAMES = {
     'ZA': 'South Africa',
 }
 _FLAG_RE   = re.compile('[\U0001F1E6-\U0001F1FF]{2}')
-_WL_TAG_RE = re.compile(r'cidr|white|белы[ех]\s+списк|\bwl\b', re.I)
-_WL_KEYS: set = set()      # ключи серверов, пришедших из «белых» источников
 _NAMES: dict = {}          # url -> итоговое имя
-
-
-def _is_whitelist_source(src_url: str) -> bool:
-    if not src_url.startswith(_IGARECK):
-        return False
-    base = src_url.rsplit('/', 1)[-1].lower()
-    return any(m in base for m in WHITELIST_SOURCE_MARKERS)
 
 
 def _iso_to_flag(code: str) -> str:
@@ -375,11 +408,161 @@ def _geoip_country(ip: str):
         return None
 
 
-def _is_whitelist(url: str) -> bool:
+# ---------- определение «белых списков» ----------
+_WL_IPS = None                 # IPSet подсетей
+_WL_SNIS: set = set()          # суффиксы доменов
+_GOOD_IDS: set = set()         # серверы, подтверждённые вами
+_GOOD_PREFIXES: set = set()    # /24 подтверждённых серверов
+_GOOD_SNIS: set = set()
+_RESTRICTED_NET = False        # скрипт запущен ВНУТРИ сети с белыми списками
+_DOMAIN_OK = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+
+
+class IPSet:
+    """Быстрая проверка вхождения IPv4 в набор подсетей (слияние + bisect)."""
+    def __init__(self, nets):
+        merged = ipaddress.collapse_addresses(nets)
+        self._starts, self._ends = [], []
+        for n in sorted(merged, key=lambda n: int(n.network_address)):
+            self._starts.append(int(n.network_address))
+            self._ends.append(int(n.broadcast_address))
+
+    def __len__(self):
+        return len(self._starts)
+
+    def __contains__(self, ip: str) -> bool:
+        try:
+            n = int(ipaddress.IPv4Address(ip))
+        except ValueError:
+            return False
+        i = bisect.bisect_right(self._starts, n) - 1
+        return i >= 0 and n <= self._ends[i]
+
+
+def _parse_cidr_text(text: str) -> list:
+    nets = []
+    for line in text.splitlines():
+        tok = line.split('#', 1)[0].strip().split()
+        if not tok:
+            continue
+        try:
+            net = ipaddress.ip_network(tok[0], strict=False)
+        except ValueError:
+            continue
+        if net.version == 4 and net.prefixlen >= 8:
+            nets.append(net)
+    return nets
+
+
+def _parse_sni_text(text: str) -> set:
+    out = set()
+    for line in text.splitlines():
+        tok = line.split('#', 1)[0].strip().lower()
+        if not tok or ' ' in tok or '/' in tok:
+            continue
+        if tok.startswith(('keyword:', 'regexp:', 'geosite:', 'ext:')):
+            continue
+        for pref in ('domain:', 'full:', '*.', '.'):
+            if tok.startswith(pref):
+                tok = tok[len(pref):]
+        tok = tok.rstrip('.')
+        if not tok or '.' not in tok:
+            continue
+        if not tok.isascii():
+            try:
+                tok = tok.encode('idna').decode('ascii')
+            except UnicodeError:
+                continue
+        if _DOMAIN_OK.match(tok):
+            out.add(tok)
+    return out
+
+
+def _sni_whitelisted(sni: str, pool: set | None = None) -> bool:
+    pool = _WL_SNIS if pool is None else pool
+    parts = sni.lower().rstrip('.').split('.')
+    return any('.'.join(parts[i:]) in pool for i in range(len(parts) - 1))
+
+
+def _prefix24(ip: str) -> str:
+    return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+
+
+def _server_id(p: dict) -> tuple:
+    return (p['proto'], p['host'].lower(), p['port'], p.get('secret') or p.get('password'))
+
+
+def load_whitelist_db() -> bool:
+    """Загружает белые списки (подсети + домены). Пустой результат = детектор слеп."""
+    global _WL_IPS
+    urls = WL_IP_LISTS + WL_SNI_LISTS
+    with cf.ThreadPoolExecutor(max_workers=len(urls)) as ex:
+        texts = dict(zip(urls, ex.map(lambda u: _fetch_with_retry(u, retries=2, delay=1.0), urls)))
+    nets, snis = [], set()
+    for u in WL_IP_LISTS:
+        got = _parse_cidr_text(texts[u]) if texts[u] else []
+        print(f"  [WL-IP ] {u.rsplit('/', 1)[-1]}: {len(got)}")
+        nets += got
+    for u in WL_SNI_LISTS:
+        got = _parse_sni_text(texts[u]) if texts[u] else set()
+        print(f"  [WL-SNI] {u.rsplit('/', 1)[-1]}: {len(got)}")
+        snis |= got
+    _WL_IPS = IPSet(nets) if nets else None
+    _WL_SNIS.clear()
+    _WL_SNIS.update(snis)
+    print(f"      Белые списки: {len(_WL_IPS) if _WL_IPS else 0} подсетей (после слияния), {len(_WL_SNIS)} доменов")
+    if _WL_IPS is None or not _WL_SNIS:
+        print("  [!] Белые списки загружены не полностью — определение будет неточным.")
+    return bool(_WL_IPS or _WL_SNIS)
+
+
+def load_good_list():
+    """Подтверждённые вами серверы (whitelist_good.txt в Gist или рядом со скриптом)."""
+    txt = None
+    try:
+        txt = _gist_read(WL_GOOD_FILE)
+    except Exception as e:
+        print(f"  Подтверждённый список: не прочитан из Gist ({e})")
+    if not txt and os.path.exists(WL_GOOD_FILE):
+        with open(WL_GOOD_FILE, encoding='utf-8') as f:
+            txt = f.read()
+    if not txt:
+        return
+    for u in PROTO_REGEX.findall(_decode_subscription(txt)):
+        p = parse_link(u)
+        if not p:
+            continue
+        _GOOD_IDS.add(_server_id(p))
+        if _is_ip_literal(p['host']):
+            with contextlib.suppress(ValueError):
+                _GOOD_PREFIXES.add(_prefix24(p['host']))
+        sni = (p['q'].get('sni') or '').lower()
+        if sni:
+            _GOOD_SNIS.add(sni)
+    print(f"  Подтверждённых вами серверов: {len(_GOOD_IDS)} "
+          f"({len(_GOOD_PREFIXES)} подсетей /24, {len(_GOOD_SNIS)} SNI)")
+
+
+def whitelist_level(url: str) -> str:
+    """'verified' — прошёл тест внутри сети с белыми списками или подтверждён вами;
+    'likely' — IP и/или SNI совпали с белыми списками (правило WL_RULE); иначе 'none'."""
+    if not WL_DETECT:
+        return 'none'
     p = parse_link(url)
     if not p:
-        return False
-    return _dedup_key(p) in _WL_KEYS or bool(_WL_TAG_RE.search(p['tag']))
+        return 'none'
+    if _RESTRICTED_NET or _server_id(p) in _GOOD_IDS:
+        return 'verified'
+    host = p['host'].lower()
+    ip = host if _is_ip_literal(host) else _RESOLVED.get(host)
+    ip_ok = bool(ip) and ((_WL_IPS is not None and ip in _WL_IPS)
+                          or _prefix24(ip) in _GOOD_PREFIXES)
+    sni = ''
+    if _get_security(p) in ('tls', 'reality'):
+        sni = (p['q'].get('sni') or p['q'].get('host') or ('' if _is_ip_literal(host) else host)).lower()
+    sni_ok = bool(sni) and (_sni_whitelisted(sni) or sni in _GOOD_SNIS)
+    ok = {'both': ip_ok and sni_ok, 'ip': ip_ok, 'sni': sni_ok, 'any': ip_ok or sni_ok}[WL_RULE]
+    return 'likely' if ok else 'none'
 
 
 def _country_for(url: str, wl: bool) -> tuple:
@@ -399,24 +582,28 @@ def _country_for(url: str, wl: bool) -> tuple:
     return code, name
 
 
-def _assign_names(results: list) -> int:
-    """Формирует имена: «🔑 🇩🇪 Germany #1» / «🔑 🇵🇱 Белые списки | Poland #1»."""
+def _assign_names(results: list) -> collections.Counter:
+    """Формирует имена: «🔑 🇩🇪 Germany #1» / «🔑 🇵🇱 Белые списки | Poland #1»
+    (у серверов, проверенных внутри белых списков или вами, в конце ещё «✓»)."""
     counters: dict = {}
-    wl_count = 0
+    levels = collections.Counter()
     for entry in results:
         url = entry[0]
-        wl = _is_whitelist(url)
+        level = whitelist_level(url)
+        levels[level] += 1
+        wl = level != 'none'
         code, cname = _country_for(url, wl)
         flag = _iso_to_flag(code) if code else '\U0001f310'
         name = f"{flag} {WHITELIST_LABEL} | {cname}" if wl else f"{flag} {cname}"
         if NAME_NUMBERING:
             n = counters[(wl, code)] = counters.get((wl, code), 0) + 1
             name += f" #{n}"
+        if level == 'verified':
+            name += " \u2713"
         if NAME_SHOW_SECURITY:
             name = f"{_get_security_level(url)[1]} {name}"
         _NAMES[url] = name
-        wl_count += wl
-    return wl_count
+    return levels
 
 
 # ============================================================
@@ -718,11 +905,89 @@ def tcp_alive(url: str):
 # ЭТАП 2: ПРОВЕРКА ЧЕРЕЗ XRAY
 # ============================================================
 
-def _status_ok(test_url: str, status: int) -> bool:
-    if test_url.endswith('generate_204'):
-        return status == 204
-    return status in OK_STATUS
+FAILS = collections.Counter()      # причины отказов xray-этапа
+_fails_lock = threading.Lock()
+_KBPS: dict = {}                   # url -> скорость в тесте передачи данных
+_PROBE: dict = {}                  # url -> (ok, причина) прямого рукопожатия
+_data_test_enabled = DATA_TEST
+REASON_RU = {
+    'xray_start': 'xray не поднялся (битый конфиг/ключи)',
+    'no_https':   'HTTPS через сервер не работает',
+    'mitm':       'подмена сертификата/контента',
+    'hijack':     'перехват DNS/ответов на несуществующий домен',
+    'google_ban': 'Google отдаёт captcha',
+    'loss':       'потери выше допустимых',
+    'slow':       'слишком большой пинг',
+    'data_test':  'не прошёл тест передачи данных',
+    'exception':  'внутренняя ошибка',
+}
 
+
+def _fail(reason: str):
+    with _fails_lock:
+        FAILS[reason] += 1
+
+
+# ---------- прямая проба рукопожатия (без xray) ----------
+
+def probe_handshake(url: str) -> tuple:
+    """Для TLS/Trojan: полноценное рукопожатие с проверкой сертификата под SNI.
+    Для Reality: сервер без нашего ключа обязан отдать настоящее TLS1.3-рукопожатие
+    сайта-маскировки. Если не отдаёт — это не рабочий Reality (или маскировочный сайт
+    у сервера мёртв). Ловит класс ошибок «TLS handshake failed» ещё до xray."""
+    p = parse_link(url)
+    if not p:
+        return False, 'parse'
+    sec = _get_security(p)
+    if sec not in ('tls', 'reality'):
+        return True, 'skip'
+    q = p['q']
+    host = p['host'].lower()
+    ip = host if _is_ip_literal(host) else _RESOLVED.get(host, host)
+    sni = q.get('sni') or q.get('host') or p['host']
+    insecure = (q.get('allowInsecure') or q.get('insecure') or '') in ('1', 'true')
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if sec == 'reality' or insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx.load_default_certs()
+    if sec == 'reality':
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    alpn = q.get('alpn')
+    with contextlib.suppress(Exception):
+        ctx.set_alpn_protocols(alpn.split(',') if alpn else ['h2', 'http/1.1'])
+
+    reason = 'timeout'
+    for _ in range(PROBE_RETRIES):
+        try:
+            with socket.create_connection((ip, p['port']), timeout=PROBE_TIMEOUT) as raw:
+                raw.settimeout(PROBE_TIMEOUT)
+                with ctx.wrap_socket(raw, server_hostname=sni) as tls:
+                    return True, tls.version() or ''
+        except ssl.SSLCertVerificationError:
+            return False, 'tls_cert'
+        except ssl.SSLError:
+            reason = 'tls_handshake'
+        except (ValueError, UnicodeError):
+            return False, 'bad_sni'
+        except (socket.timeout, TimeoutError):
+            reason = 'timeout'
+        except OSError:
+            reason = 'conn_reset'
+    return False, reason
+
+
+def _probe_blocks(url: str) -> bool:
+    ok, _ = _PROBE.get(url, (True, ''))
+    if ok:
+        return False
+    p = parse_link(url)
+    return PROBE_STRICT_REALITY if p and _get_security(p) == 'reality' else PROBE_STRICT_TLS
+
+
+# ---------- проверки через поднятый xray ----------
 
 def _check_google_ban(session: requests.Session) -> bool:
     """False только при явном редиректе на captcha Google; всё прочее — пропускаем."""
@@ -737,55 +1002,90 @@ def _check_google_ban(session: requests.Session) -> bool:
     return True
 
 
-def _tls_integrity(session: requests.Session) -> bool | None:
-    """True — ок, False — подмена сертификата/контента, None — не удалось проверить."""
+def _is_hijacked(session: requests.Session) -> bool:
+    """Нормальный прокси на несуществующий домен отвечает ошибкой. Если пришёл
+    200/204/редирект — сервер подсовывает заглушку (перехват DNS/captive-портал)."""
+    host = f"probe-{os.urandom(4).hex()}.invalid"
     try:
-        r = session.get(INTEGRITY_URL, timeout=REQUEST_TIMEOUT, allow_redirects=False)
-        if r.status_code == 204:
-            return True
-        return False if r.status_code == 200 else None
-    except requests.exceptions.SSLError:
-        return False
+        r = session.get(f"http://{host}/", timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        return r.status_code in (200, 204, 301, 302, 307, 308)
     except requests.RequestException:
-        return None
+        return False
 
 
-def _measure(port: int):
+def _data_test(session: requests.Session) -> tuple:
+    """Скачивает DATA_TEST_BYTES байт через прокси. Ловит серверы, у которых
+    рукопожатие проходит, а данные режутся/обрываются/душатся."""
+    t0 = time.perf_counter()
+    n = 0
+    try:
+        with session.get(DATA_TEST_URL, timeout=REQUEST_TIMEOUT, stream=True) as r:
+            if r.status_code != 200:
+                return False, 0.0
+            for chunk in r.iter_content(65536):
+                n += len(chunk)
+                if time.perf_counter() - t0 > DATA_TEST_MAX_SEC:
+                    break
+    except requests.RequestException:
+        return False, 0.0
+    dt = max(time.perf_counter() - t0, 1e-3)
+    if n < DATA_TEST_BYTES * 0.98:
+        return False, 0.0
+    kbps = n / 1024 / dt
+    return kbps >= MIN_KBPS, kbps
+
+
+def _cert_error(e: Exception) -> bool:
+    return 'CERTIFICATE_VERIFY_FAILED' in str(e)
+
+
+def _measure(port: int) -> tuple:
+    """Возвращает ((score, avg, jitter, losses, kbps), '') либо (None, причина)."""
     session = requests.Session()
     session.trust_env = False
     session.proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+    session.headers['Connection'] = 'close'    # каждый раз новое соединение, как в реальном тесте клиента
     try:
-        if CHECK_GOOGLE_BAN and not _check_google_ban(session):
-            return None
-        if FILTER_MITM or REQUIRE_HTTPS:
-            ok = _tls_integrity(session)
-            if (FILTER_MITM and ok is False) or (REQUIRE_HTTPS and ok is not True):
-                return None
-
         pings, losses = [], 0
-        for _ in range(PING_ROUNDS):
+        for r_i in range(PING_ROUNDS):
+            k = r_i % len(HTTPS_TARGETS)
             ok = False
-            for test_url in TEST_URLS:
+            for u in HTTPS_TARGETS[k:] + HTTPS_TARGETS[:k]:
                 try:
                     t0 = time.perf_counter()
-                    r = session.get(test_url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+                    resp = session.get(u, timeout=REQUEST_TIMEOUT, allow_redirects=False)
                     ms = int((time.perf_counter() - t0) * 1000)
-                    if _status_ok(test_url, r.status_code):
+                    if resp.status_code == 204:
                         pings.append(ms)
                         ok = True
                         break
+                    if resp.status_code == 200 and FILTER_MITM:
+                        return None, 'mitm'          # 200 вместо 204 — подсунута заглушка
+                except requests.exceptions.SSLError as e:
+                    if FILTER_MITM and _cert_error(e):
+                        return None, 'mitm'
                 except requests.RequestException:
                     continue
             if not ok:
                 losses += 1
-
-        if not pings or losses / PING_ROUNDS > MAX_LOSS_RATE:
-            return None
+            if r_i == 0 and not pings:
+                return None, 'no_https'              # не тратим время на заведомо мёртвых
+        if losses / PING_ROUNDS > MAX_LOSS_RATE:
+            return None, 'loss'
         avg = int(statistics.median(pings))
         if avg > MAX_PING_MS:
-            return None
+            return None, 'slow'
+        if CHECK_GOOGLE_BAN and not _check_google_ban(session):
+            return None, 'google_ban'
+        if HIJACK_CHECK and _is_hijacked(session):
+            return None, 'hijack'
+        kbps = 0.0
+        if _data_test_enabled:
+            ok, kbps = _data_test(session)
+            if not ok:
+                return None, 'data_test'
         jitter = int(statistics.stdev(pings)) if len(pings) > 1 else 0
-        return avg + jitter // 2, avg, jitter, losses
+        return (avg + jitter // 2, avg, jitter, losses, kbps), ''
     finally:
         session.close()
 
@@ -808,10 +1108,17 @@ def test_via_xray(url: str, ru_url: str | None = None):
     try:
         with _xray(build_config(out, port, extra), port) as started:
             if not started:
+                _fail('xray_start')
                 return None
-            m = _measure(port)
-            return (url, *m) if m else None
+            m, reason = _measure(port)
+            if m is None:
+                _fail(reason)
+                return None
+            score, avg, jitter, losses, kbps = m
+            _KBPS[url] = kbps
+            return (url, score, avg, jitter, losses)
     except Exception:
+        _fail('exception')
         return None
     finally:
         PORTS.release(port)
@@ -903,17 +1210,14 @@ def fetch_configs() -> list:
         found = PROTO_REGEX.findall(text)
         fmt = "plain" if text == raw.strip() else "base64"
         print(f"  [OK] {src.rsplit('/', 1)[-1]}  ->  {len(found)}  [{fmt}]")
-        wl = _is_whitelist_source(src)
-        all_raw.extend((c, wl) for c in found)
+        all_raw.extend(found)
 
     seen_keys, per_endpoint, unique = set(), {}, []
-    for cfg, wl in all_raw:
+    for cfg in all_raw:
         p = parse_link(cfg)
         if not p:
             continue
         key = _dedup_key(p)
-        if wl:
-            _WL_KEYS.add(key)
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -947,185 +1251,6 @@ def _static_filter(urls: list) -> tuple[list, dict]:
 
 
 # ============================================================
-# HTML
-# ============================================================
-
-def _esc(s) -> str:
-    return html_lib.escape(str(s), quote=True)
-
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VPN Scout</title>
-<style>
-body { margin:0; padding:0; background:#0a0c10; color:#e2e8f0; font-family:Arial,sans-serif; font-size:13px; }
-h1 { margin:0; padding:20px 20px 0; font-size:24px; color:#fff; }
-.info { padding:8px 20px 16px; color:#718096; font-size:12px; }
-.info b { color:#00e5ff; }
-.legend { padding:0 20px 10px; font-size:11px; color:#718096; display:flex; gap:16px; flex-wrap:wrap; }
-.stats-row { display:flex; gap:10px; padding:0 20px 10px; flex-wrap:wrap; }
-.stat { flex:1; min-width:120px; background:#111318; border:1px solid #1e2230; border-radius:8px; padding:14px 18px; text-align:center; }
-.stat-num { font-size:26px; font-weight:700; color:#fff; }
-.stat-lbl { font-size:11px; color:#718096; margin-top:4px; }
-.tab-bar { padding:10px 20px; display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
-.tab-btn { padding:10px 30px; border-radius:8px; border:2px solid #1e2230; background:#111318; color:#e2e8f0; font-size:14px; font-weight:700; cursor:pointer; }
-.tab-btn.active-intl { background:#00e5ff; color:#000; border-color:#00e5ff; }
-.tab-btn.active-ru  { background:#ff6b35; color:#fff; border-color:#ff6b35; }
-.section { display:none; padding:0 20px 40px; }
-.section.visible { display:block; }
-.tbl-wrap { overflow-x:auto; border:1px solid #1e2230; border-radius:8px; }
-table { width:100%; border-collapse:collapse; background:#111318; }
-thead th { background:#0d1017; color:#718096; font-size:10px; text-transform:uppercase; padding:11px 12px; text-align:left; border-bottom:1px solid #1e2230; white-space:nowrap; }
-tbody tr:hover { background:#161b26; }
-#toast { position:fixed; bottom:24px; right:24px; background:#06d6a0; color:#000; font-weight:700; padding:10px 20px; border-radius:8px; opacity:0; transition:opacity .3s; pointer-events:none; z-index:999; }
-#toast.show { opacity:1; }
-</style>
-</head>
-<body>
-<h1>VPN Scout</h1>
-<div class="info">Обновлено: <b>__UPDATED__</b> &nbsp;|&nbsp; Время проверки: <b>__ELAPSED__с</b> &nbsp;|&nbsp; Пинг измерен с сервера проверки, не с вашего IP</div>
-<div class="legend">
-  <span>🔑 Reality/XTLS</span><span>🔒 TLS / SS-AEAD</span><span>⚠️ Небезопасно</span>
-</div>
-<div class="stats-row">
-  <div class="stat"><div class="stat-num" style="color:#00e5ff">__N_INTL__</div><div class="stat-lbl">🌍 Зарубежных</div></div>
-  <div class="stat"><div class="stat-num" style="color:#ff6b35">__N_RU__</div><div class="stat-lbl">🇷🇺 Российских</div></div>
-  <div class="stat"><div class="stat-num">__TOTAL__</div><div class="stat-lbl">Всего живых</div></div>
-  <div class="stat"><div class="stat-num" style="color:#06d6a0">__BEST__ms</div><div class="stat-lbl">Лучший пинг</div></div>
-</div>
-<div class="tab-bar">
-  <button class="tab-btn active-intl" id="btn-intl" onclick="showTab('intl')">🌍 Зарубежные (__N_INTL__)</button>
-  <button class="tab-btn" id="btn-ru" onclick="showTab('ru')">🇷🇺 Российские (__N_RU__)</button>
-  <button id="btn-pingall" onclick="pingAll()" style="margin-left:auto;background:#1a1040;border:2px solid #a78bfa;color:#a78bfa;border-radius:8px;padding:10px 22px;font-size:14px;font-weight:700;cursor:pointer">
-    ⚡ Грубая проверка хоста с моего IP
-  </button>
-  <span id="ping-status" style="font-size:12px;color:#718096"></span>
-</div>
-<div class="section visible" id="sec-intl"><div class="tbl-wrap"><table>
-  <thead><tr><th>#</th><th>Сервер</th><th>Протокол</th><th>Транспорт</th><th>Безопасность</th><th>🔒</th><th>Пинг</th><th>Jitter</th><th>Loss</th><th></th></tr></thead>
-  <tbody>__ROWS_INTL__</tbody>
-</table></div></div>
-<div class="section" id="sec-ru"><div class="tbl-wrap"><table>
-  <thead><tr><th>#</th><th>Сервер</th><th>Протокол</th><th>Транспорт</th><th>Безопасность</th><th>🔒</th><th>Пинг</th><th>Jitter</th><th>Loss</th><th></th></tr></thead>
-  <tbody>__ROWS_RU__</tbody>
-</table></div></div>
-<div id="toast">Скопировано!</div>
-<script>
-function showTab(name) {
-  document.getElementById('sec-intl').className = 'section' + (name === 'intl' ? ' visible' : '');
-  document.getElementById('sec-ru').className   = 'section' + (name === 'ru'   ? ' visible' : '');
-  document.getElementById('btn-intl').className = 'tab-btn' + (name === 'intl' ? ' active-intl' : '');
-  document.getElementById('btn-ru').className   = 'tab-btn' + (name === 'ru'   ? ' active-ru'   : '');
-}
-async function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return; }
-  var ta = document.createElement('textarea');
-  ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
-  document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-}
-async function copyVpn(btn) {
-  try {
-    await copyText(btn.getAttribute('data-url'));
-    btn.textContent = 'OK!';
-    var t = document.getElementById('toast'); t.className = 'show';
-    setTimeout(function() { btn.textContent = 'Copy'; t.className = ''; }, 1500);
-  } catch (e) { alert('Не удалось скопировать'); }
-}
-// Браузер не умеет raw TCP, поэтому это ГРУБАЯ оценка: достижим ли хост по HTTPS.
-// Reality/не-HTTP серверы могут показывать ✗ даже будучи рабочими.
-async function pingHost(host) {
-  if (!host) return null;
-  var targets = ['https://' + host + '/favicon.ico', 'https://' + host + '/'];
-  for (var i = 0; i < targets.length; i++) {
-    try {
-      var t0 = performance.now();
-      await fetch(targets[i], { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(5000) });
-      return Math.round(performance.now() - t0);
-    } catch (e) {}
-  }
-  return null;
-}
-async function pingAll() {
-  var btn = document.getElementById('btn-pingall');
-  var status = document.getElementById('ping-status');
-  btn.disabled = true; btn.style.opacity = '0.6';
-  var spans = Array.from(document.querySelectorAll('.ping-live'));
-  var done = 0, BATCH = 10;
-  for (var i = 0; i < spans.length; i += BATCH) {
-    await Promise.all(spans.slice(i, i + BATCH).map(async function(span) {
-      span.textContent = '...';
-      var ms = await pingHost(span.getAttribute('data-host'));
-      done++; status.textContent = done + '/' + spans.length;
-      if (ms === null) { span.textContent = '✗'; span.style.color = '#ef476f'; }
-      else { span.textContent = ms + 'ms'; span.style.color = ms < 300 ? '#06d6a0' : ms < 1000 ? '#ffd166' : '#ef476f'; }
-    }));
-  }
-  btn.disabled = false; btn.style.opacity = '1';
-  status.textContent = '✓ Готово (' + spans.length + ')';
-}
-</script>
-</body>
-</html>"""
-
-
-def generate_html_viewer(intl_results: list, ru_results: list, elapsed: int) -> str:
-    def ping_color(avg):
-        return '#06d6a0' if avg < 300 else '#ffd166' if avg < 1000 else '#ef476f'
-
-    badge = ('background:#1a1f2e;color:#9aa0b4;border:1px solid #2a3040;'
-             'border-radius:4px;padding:2px 7px;font-size:11px')
-    sec_colors = {'reality': '#a78bfa', 'secure': '#06d6a0', 'insecure': '#ef476f'}
-
-    def make_rows(results):
-        if not results:
-            return ('<tr><td colspan="10" style="text-align:center;padding:30px;'
-                    'color:#718096">Нет серверов</td></tr>')
-        rows = []
-        for i, (url, _score, avg, jitter, losses) in enumerate(results, 1):
-            p = parse_link(url) or {'proto': '?', 'host': '', 'tag': '', 'q': {}}
-            host = p['host']
-            tag = _NAMES.get(url) or (p['tag'] or host)[:40]
-            loss_pct = int(losses / PING_ROUNDS * 100)
-            level, icon, tip = _get_security_level(url)
-            sec = _get_security(p) if p['proto'] != '?' else '?'
-            net = _get_network(p) if p['proto'] != '?' else '?'
-            rows.append(
-                '<tr style="border-bottom:1px solid #1e2230">'
-                f'<td style="padding:9px 10px;color:#4a5568">{i}</td>'
-                f'<td style="padding:9px 10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(tag)}</td>'
-                f'<td style="padding:9px 10px"><span style="background:#0d2b33;color:#00e5ff;border:1px solid #005f6b;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">{_esc(p["proto"].upper())}</span></td>'
-                f'<td style="padding:9px 10px"><span style="{badge}">{_esc(net)}</span></td>'
-                f'<td style="padding:9px 10px"><span style="{badge}">{_esc(sec)}</span></td>'
-                f'<td style="padding:9px 10px;text-align:center"><span title="{_esc(tip)}" style="font-size:15px;cursor:help;color:{sec_colors[level]}">{icon}</span></td>'
-                f'<td style="padding:9px 10px;color:{ping_color(avg)};font-weight:700">{avg}ms</td>'
-                f'<td style="padding:9px 10px;color:#718096">{jitter}ms</td>'
-                f'<td style="padding:9px 10px;color:{"#06d6a0" if loss_pct == 0 else "#ef476f"}">{loss_pct}%</td>'
-                f'<td style="padding:9px 10px;white-space:nowrap"><button onclick="copyVpn(this)" data-url="{_esc(url)}" style="background:#0d2b33;border:1px solid #005f6b;color:#00e5ff;border-radius:5px;padding:4px 10px;cursor:pointer;font-size:13px;margin-right:6px">Copy</button>'
-                f'<span class="ping-live" data-host="{_esc(host)}" style="font-size:12px;color:#4a5568">—</span></td>'
-                '</tr>'
-            )
-        return '\n'.join(rows)
-
-    repl = {
-        '__UPDATED__':  time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime()),
-        '__ELAPSED__':  str(elapsed),
-        '__N_INTL__':   str(len(intl_results)),
-        '__N_RU__':     str(len(ru_results)),
-        '__TOTAL__':    str(len(intl_results) + len(ru_results)),
-        '__BEST__':     str(min((r[2] for r in intl_results), default=0)),
-        '__ROWS_INTL__': make_rows(intl_results),
-        '__ROWS_RU__':   make_rows(ru_results),
-    }
-    out = HTML_TEMPLATE
-    for k, v in repl.items():
-        out = out.replace(k, v)
-    return out
-
-
-# ============================================================
 # ВЫВОД
 # ============================================================
 
@@ -1150,22 +1275,54 @@ def _print_breakdown(results: list):
         print(f"    {a}/{b}/{n}: {k}")
 
 
-def _update_gist(files: dict):
+def _get_token() -> str | None:
     token = os.environ.get('GH_TOKEN')
     if not token:
         with contextlib.suppress(Exception):
             token = subprocess.run(["gh", "auth", "token"], capture_output=True,
                                    text=True).stdout.strip()
+    return token or None
+
+
+def _gist_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def _gist_read(name: str) -> str | None:
+    token = _get_token()
+    if not (GID and token):
+        return None
+    req = url_req.Request(f"https://api.github.com/gists/{GID}", headers=_gist_headers(token))
+    with url_req.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+    f = data.get('files', {}).get(name)
+    if not f:
+        return None
+    if f.get('truncated') and f.get('raw_url'):
+        return requests.get(f['raw_url'], timeout=30).text
+    return f.get('content')
+
+
+def _gist_filenames() -> set:
+    token = _get_token()
+    if not (GID and token):
+        return set()
+    req = url_req.Request(f"https://api.github.com/gists/{GID}", headers=_gist_headers(token))
+    with url_req.urlopen(req, timeout=30) as resp:
+        return set(json.load(resp).get('files', {}))
+
+
+def _update_gist(files: dict, delete: tuple | list = ()):
+    token = _get_token()
     if not token:
         print(" Не удалось получить токен GitHub (GH_TOKEN)!")
         return
-    payload = json.dumps({"files": {n: {"content": c} for n, c in files.items()}}).encode()
-    req = url_req.Request(
-        f"https://api.github.com/gists/{GID}", data=payload, method="PATCH",
-        headers={
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
-        })
+    body = {n: {"content": c} for n, c in files.items()}
+    body.update({n: None for n in delete})          # null = удалить файл из Gist
+    payload = json.dumps({"files": body}).encode()
+    req = url_req.Request(f"https://api.github.com/gists/{GID}", data=payload, method="PATCH",
+                          headers={**_gist_headers(token), "Content-Type": "application/json"})
     try:
         with url_req.urlopen(req, timeout=30) as resp:
             print(" Gist обновлён." if resp.status == 200 else f" Gist: статус {resp.status}")
@@ -1176,8 +1333,121 @@ def _update_gist(files: dict):
 
 
 # ============================================================
+# ИСТОРИЯ ЗАПУСКОВ (аптайм)
+# ============================================================
+_HISTORY: dict = {}
+
+
+def _hkey(url: str) -> str:
+    p = parse_link(url)
+    return hashlib.sha1(repr(_dedup_key(p)).encode()).hexdigest()[:16]
+
+
+def _load_history() -> dict:
+    txt = None
+    try:
+        txt = _gist_read(HISTORY_FILE)
+    except Exception as e:
+        print(f"  История: не удалось прочитать из Gist ({e})")
+    if not txt and os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, encoding='utf-8') as f:
+            txt = f.read()
+    try:
+        data = json.loads(txt) if txt else {}
+    except ValueError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _update_history(history: dict, candidates: list, passed: set) -> dict:
+    now = int(time.time())
+    for u in candidates:
+        k = _hkey(u)
+        rec = history.setdefault(k, {'r': [], 't': now})
+        rec['r'] = (rec['r'] + [1 if k in passed else 0])[-HISTORY_RUNS:]
+        rec['t'] = now
+    cutoff = now - HISTORY_MAX_AGE_DAYS * 86400
+    for k in [k for k, v in history.items() if v.get('t', 0) < cutoff]:
+        del history[k]
+    return history
+
+
+def _uptime(url: str) -> float | None:
+    rec = _HISTORY.get(_hkey(url))
+    runs = rec['r'] if rec else []
+    return sum(runs) / len(runs) if len(runs) >= MIN_HISTORY_RUNS else None
+
+
+def _rank_key(entry: tuple) -> float:
+    up = _uptime(entry[0])
+    return entry[1] / max(up if up is not None else 0.7, 0.2)
+
+
+# ============================================================
+# ПРОВЕРКА ОКРУЖЕНИЯ
+# ============================================================
+
+def _reachable(session: requests.Session, url: str, want_204: bool = False) -> bool:
+    try:
+        r = session.get(url, timeout=8, allow_redirects=False)
+        return r.status_code == 204 if want_204 else r.status_code < 500
+    except requests.RequestException:
+        return False
+
+
+def _baseline_check() -> bool:
+    """Прямые запросы к целям проверки. Заодно определяет, не запущен ли скрипт
+    внутри сети с белыми списками: российские сайты доступны, зарубежные — нет."""
+    global _data_test_enabled, _RESTRICTED_NET
+    s = requests.Session()
+    s.trust_env = False
+    good = [u for u in HTTPS_TARGETS if _reachable(s, u, want_204=True)]
+    if not good:
+        ru_ok = any(_reachable(s, u) for u in RU_CONTROL_URLS)
+        if not ru_ok:
+            print("  [!] Нет прямого доступа ни к зарубежным, ни к российским целям — проверка невозможна.")
+            return False
+        _RESTRICTED_NET = True
+        print("  [WL] Обнаружена сеть с БЕЛЫМИ СПИСКАМИ: зарубежные сайты напрямую недоступны,")
+        print("       российские — доступны. Все серверы, прошедшие тест отсюда, помечаются как ПРОВЕРЕННЫЕ (✓).")
+        return True
+    HTTPS_TARGETS[:] = good
+    if _data_test_enabled:
+        ok = False
+        try:
+            r = s.get(DATA_TEST_URL, timeout=15)
+            ok = r.status_code == 200 and len(r.content) >= DATA_TEST_BYTES * 0.98
+        except requests.RequestException:
+            pass
+        if not ok:
+            print("  [!] Тест передачи данных недоступен напрямую — отключён на этот запуск.")
+            _data_test_enabled = False
+    print(f"  Цели проверки: {len(HTTPS_TARGETS)} HTTPS, тест данных: {'ВКЛ' if _data_test_enabled else 'ВЫКЛ'}")
+    return True
+
+
+# ============================================================
 # ГЛАВНЫЙ ЗАПУСК
 # ============================================================
+
+def _run_xray_stage(urls: list, label: str) -> list:
+    results, total = [], len(urls)
+    with cf.ThreadPoolExecutor(max_workers=XRAY_WORKERS) as ex:
+        for n, res in enumerate(ex.map(test_via_xray, urls), 1):
+            if res:
+                results.append(res)
+            if n % 25 == 0 or n == total:
+                print(f"  {label}: {n}/{total}  |  прошли: {len(results)}")
+    return results
+
+
+def _print_fails(title: str, counter: collections.Counter):
+    if not counter:
+        return
+    print(f"  {title}:")
+    for reason, k in counter.most_common():
+        print(f"    {k:>4}  {REASON_RU.get(reason, reason)}")
+
 
 def run():
     t_start = time.time()
@@ -1187,16 +1457,25 @@ def run():
     ver = subprocess.run([XRAY_BIN, 'version'], capture_output=True, text=True).stdout.splitlines()
 
     print("=" * 60)
-    print("  VPN SCOUT 2.0")
+    print("  VPN SCOUT 3.0")
     print(f"  {ver[0] if ver else 'xray: версия неизвестна'}")
-    print(f"  TCP: {TCP_WORKERS} воркеров / {TCP_TIMEOUT}с;  xray: {XRAY_WORKERS} воркеров")
-    print(f"  Раундов: {PING_ROUNDS}, макс. пинг: {MAX_PING_MS}мс, MITM-проверка: {'ВКЛ' if FILTER_MITM else 'ВЫКЛ'}")
-    print(f"  Цепочка через РФ: {'ВКЛ' if CHAIN_PROXY else 'ВЫКЛ'}")
+    print(f"  xray: {XRAY_WORKERS} воркеров, раундов {PING_ROUNDS}, макс. пинг {MAX_PING_MS}мс")
+    print(f"  Белые списки: определение {'ВКЛ, правило ' + WL_RULE if WL_DETECT else 'ВЫКЛ'}")
+    print(f"  Проба рукопожатия: {'ВКЛ' if PROBE_HANDSHAKE else 'ВЫКЛ'} | "
+          f"подтверждающий проход: {'ВКЛ' if CONFIRM_PASS else 'ВЫКЛ'} | "
+          f"цепочка через РФ: {'ВКЛ' if CHAIN_PROXY else 'ВЫКЛ'}")
     print("=" * 60)
 
     _init_geoip()
+    if not _baseline_check():
+        return
+    if WL_DETECT and not _RESTRICTED_NET:
+        print("\n[WL] Загрузка белых списков операторов...")
+        load_whitelist_db()
+    if WL_DETECT:
+        load_good_list()
 
-    print("\n[1/5] Сбор конфигов...")
+    print("\n[1/7] Сбор конфигов...")
     configs = fetch_configs()
     print(f"      Уникальных серверов (без дублей по fp; до {MAX_PER_ENDPOINT} вариантов на host:port): {len(configs)}")
     if not configs:
@@ -1204,11 +1483,12 @@ def run():
         return
 
     configs, cnt = _static_filter(configs)
-    print(f"[2/5] Статические фильтры: осталось {len(configs)} "
+    print(f"[2/7] Статические фильтры: осталось {len(configs)} "
           f"(небезоп.: {cnt['insecure']}, TLS-only: {cnt['lock']}, pbk/sid: {cnt['pbk']}, "
           f"неподдерж.: {cnt['bad']})")
+    candidates = list(configs)
 
-    print(f"\n[3/5] TCP-проверка ({TCP_WORKERS} воркеров)...")
+    print(f"\n[3/7] TCP-проверка ({TCP_WORKERS} воркеров)...")
     with cf.ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
         alive = [r for r in ex.map(tcp_alive, configs) if r]
     print(f"      TCP живых: {len(alive)} / {len(configs)}  ({int(time.time() - t_start)}с)")
@@ -1216,42 +1496,101 @@ def run():
         print("Нет живых серверов после TCP-проверки.")
         return
 
-    if FILTER_RUSSIAN and not CHAIN_PROXY:      # экономим xray-время
+    if FILTER_RUSSIAN and not CHAIN_PROXY:
         before = len(alive)
-        alive = [u for u in alive if not _is_russian_server(parse_link(u)['host'], u)]
+        alive = [u for u in alive
+                 if not _is_russian_server(parse_link(u)['host'], u) or whitelist_level(u) != 'none']
         print(f"      Российских отброшено до xray: {before - len(alive)}")
 
-    print(f"\n[4/5] xray-проверка {len(alive)} серверов ({XRAY_WORKERS} воркеров)...")
-    results, total = [], len(alive)
-    with cf.ThreadPoolExecutor(max_workers=XRAY_WORKERS) as ex:
-        for n, res in enumerate(ex.map(test_via_xray, alive), 1):
-            if res:
-                results.append(res)
-            if n % 25 == 0 or n == total:
-                print(f"  Прогресс: {n}/{total}  |  прошли: {len(results)}")
+    if PROBE_HANDSHAKE:
+        print(f"\n[4/7] Прямая проба TLS/Reality-рукопожатия ({len(alive)} серверов)...")
+        with cf.ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
+            probes = list(ex.map(probe_handshake, alive))
+        keep, dropped, shadow = [], collections.Counter(), collections.Counter()
+        for u, (ok, why) in zip(alive, probes):
+            _PROBE[u] = (ok, why)
+            if not ok and _probe_blocks(u):
+                dropped[why] += 1
+                continue
+            if not ok:
+                shadow[why] += 1
+            keep.append(u)
+        print(f"      Отсеяно пробой: {sum(dropped.values())}  {dict(dropped) if dropped else ''}")
+        if shadow:
+            print(f"      Провалили пробу, но пропущены (нестрогий режим): {sum(shadow.values())}  {dict(shadow)}")
+        alive = keep
+    else:
+        print("\n[4/7] Проба рукопожатия отключена.")
+    if not alive:
+        print("Нет серверов после пробы.")
+        return
 
-    print("\n[5/5] Постобработка и сохранение...")
+    print(f"\n[5/7] xray-проверка {len(alive)} серверов (HTTPS, перехват, передача данных)...")
+    results = _run_xray_stage(alive, "xray")
+    _print_fails("Причины отказов", FAILS)
+    shadow_urls = [u for u in alive if not _PROBE.get(u, (True, ''))[0]]
+    if shadow_urls:
+        passed_urls = {r[0] for r in results}
+        print(f"  Калибровка пробы: из {len(shadow_urls)} «проваливших» пробу xray прошли "
+              f"{sum(1 for u in shadow_urls if u in passed_urls)}")
     if not results:
         print("Нет рабочих серверов.")
         return
-    results.sort(key=lambda x: x[1])
 
-    ru_pool, intl_pool = [], []
+    if CONFIRM_PASS:
+        print(f"\n[6/7] Подтверждающий проход через {CONFIRM_DELAY}с ({len(results)} серверов)...")
+        time.sleep(CONFIRM_DELAY)
+        first = {r[0]: r for r in results}
+        FAILS.clear()
+        second = _run_xray_stage(list(first), "подтверждение")
+        merged = []
+        for r in second:
+            a = first[r[0]]
+            merged.append((r[0], (a[1] + r[1]) // 2, (a[2] + r[2]) // 2,
+                           max(a[3], r[3]), max(a[4], r[4])))
+        print(f"      Не подтвердились (мигают): {len(first) - len(merged)}")
+        results = merged
+        if not results:
+            print("Нет подтверждённых серверов.")
+            return
+    else:
+        print("\n[6/7] Подтверждающий проход отключён.")
+
+    print("\n[7/7] История, постобработка и сохранение...")
+    history = _load_history()
+    if len(results) >= 5:                      # защита: сбой раннера не должен «убить» историю
+        history = _update_history(history, candidates, {_hkey(r[0]) for r in results})
+    _HISTORY.clear()
+    _HISTORY.update(history)
+    before = len(results)
+    results = [r for r in results
+               if (_uptime(r[0]) is None or _uptime(r[0]) >= MIN_UPTIME)]
+    if before != len(results):
+        print(f"      Отсеяно по аптайму (<{int(MIN_UPTIME * 100)}% за последние запуски): {before - len(results)}")
+
+    # Сервер с российским IP, но определённый как «белые списки», — это как раз то, что нужно
+    # в основной подписке (вход в белом списке, выход за рубеж), поэтому он НЕ уходит в РФ-пул.
+    ru_geo, ru_pool, intl_pool = [], [], []
     for e in results:
-        (ru_pool if _is_russian_server(parse_link(e[0])['host'], e[0]) else intl_pool).append(e)
+        is_ru = _is_russian_server(parse_link(e[0])['host'], e[0])
+        if is_ru:
+            ru_geo.append(e)
+        (ru_pool if is_ru and whitelist_level(e[0]) == 'none' else intl_pool).append(e)
 
-    if CHAIN_PROXY and ru_pool and intl_pool:
-        _chain_ru_urls[:] = [e[0] for e in ru_pool[:CHAIN_TOP_N]
+    ru_geo_urls = {e[0] for e in ru_geo}
+    if CHAIN_PROXY and ru_geo and intl_pool:
+        _chain_ru_urls[:] = [e[0] for e in sorted(ru_geo, key=_rank_key)[:CHAIN_TOP_N]
                              if parse_link(e[0])['proto'] in ('vless', 'trojan', 'ss')]
-        print(f"  Цепочка: перепроверяем {len(intl_pool)} зарубежных через {len(_chain_ru_urls)} РФ-входов...")
+        targets = [e[0] for e in intl_pool if e[0] not in ru_geo_urls]
+        print(f"  Цепочка: перепроверяем {len(targets)} зарубежных через {len(_chain_ru_urls)} РФ-входов...")
         chained = []
         with cf.ThreadPoolExecutor(max_workers=XRAY_WORKERS) as ex:
-            for n, res in enumerate(ex.map(_test_via_chain, [e[0] for e in intl_pool]), 1):
+            for n, res in enumerate(ex.map(_test_via_chain, targets), 1):
                 if res:
                     chained.append(res)
-                if n % 25 == 0 or n == len(intl_pool):
-                    print(f"  Цепочка: {n}/{len(intl_pool)}  |  прошли: {len(chained)}")
-        intl_pool = chained
+                if n % 25 == 0 or n == len(targets):
+                    print(f"  Цепочка: {n}/{len(targets)}  |  прошли: {len(chained)}")
+        intl_pool = chained + [e for e in intl_pool if e[0] in ru_geo_urls]
     elif CHAIN_PROXY:
         print("  Цепочка пропущена: нет российских или зарубежных серверов.")
 
@@ -1260,27 +1599,27 @@ def run():
 
     if FILTER_DEAD_SNI:
         uniq = list({e[0] for e in intl_pool + ru_pool})
-        print(f"  Проверка SNI ({len(uniq)} уник.)...")
         with cf.ThreadPoolExecutor(max_workers=30) as ex:
             list(ex.map(_check_sni, uniq))
         intl_pool = [e for e in intl_pool if _check_sni(e[0])]
         ru_pool   = [e for e in ru_pool   if _check_sni(e[0])]
 
-    intl_results = sorted(intl_pool, key=lambda x: x[1])[:TOP_N_EACH]
-    ru_results   = sorted(ru_pool,   key=lambda x: x[1])[:TOP_N_EACH]
-    wl_i = _assign_names(intl_results)
-    wl_r = _assign_names(ru_results)
-    print(f"  Помечено «{WHITELIST_LABEL}»: {wl_i} из {len(intl_results)} зарубежных, "
-          f"{wl_r} из {len(ru_results)} российских")
+    intl_results = sorted(intl_pool, key=_rank_key)[:TOP_N_EACH]
+    ru_results   = sorted(ru_pool,   key=_rank_key)[:TOP_N_EACH]
+    lv_i = _assign_names(intl_results)
+    lv_r = _assign_names(ru_results)
+    for title, lv, n in (("зарубежные", lv_i, len(intl_results)), ("российские", lv_r, len(ru_results))):
+        print(f"  Белые списки, {title}: проверено ✓ {lv['verified']}, по спискам IP/SNI {lv['likely']}, "
+              f"не определены {lv['none']}  (из {n})")
     elapsed = int(time.time() - t_start)
 
     print(f"\n{'─' * 60}")
     print(f"  Зарубежных: {len(intl_results)}   Российских: {len(ru_results)}   Время: {elapsed}с")
     print(f"{'─' * 60}")
     for i, (url, _s, avg, jitter, losses) in enumerate(intl_results[:10], 1):
-        p = parse_link(url)
-        print(f"  {i:<3}{avg:>5}мс  jitter:{jitter:>4}  loss:{losses}/{PING_ROUNDS}  "
-              f"{_NAMES.get(url, p['host'])}")
+        up = _uptime(url)
+        print(f"  {i:<3}{avg:>5}мс  {_KBPS.get(url, 0):>5.0f}КБ/с  "
+              f"аптайм:{'—' if up is None else f'{up:.0%}':>5}  {_NAMES.get(url, '')}")
 
     _print_breakdown(intl_results + ru_results)
 
@@ -1290,9 +1629,9 @@ def run():
 
     vps_text = "\n".join(_tagged_url(r[0]) for r in intl_results)
     sub_text = base64.b64encode(vps_text.encode("utf-8")).decode("ascii")
-    html_text = generate_html_viewer(intl_results, ru_results, elapsed)
 
-    files = {FILE_NAME: vps_text, SUB_FILE: sub_text, VIEWER_FILE: html_text}
+    files = {FILE_NAME: vps_text, SUB_FILE: sub_text,
+             HISTORY_FILE: json.dumps(history, separators=(',', ':'))}
     if PUBLISH_RU_FILES and ru_results:
         ru_text = "\n".join(_tagged_url(r[0]) for r in ru_results)
         files[RU_FILE] = ru_text
@@ -1300,11 +1639,16 @@ def run():
     for name, content in files.items():
         with open(name, "w", encoding="utf-8") as f:
             f.write(content)
-    print(f"\n Сохранено: {FILE_NAME} ({len(intl_results)}), {SUB_FILE}, {VIEWER_FILE}")
+    print(f"\n Сохранено: {FILE_NAME} ({len(intl_results)}), {SUB_FILE}, {HISTORY_FILE}")
 
     if GID:
         print("Обновляем Gist...")
-        _update_gist(files)
+        stale = []
+        with contextlib.suppress(Exception):
+            stale = [n for n in OBSOLETE_GIST_FILES if n in _gist_filenames()]
+        _update_gist(files, delete=stale)
+        if stale:
+            print(f" Удалены устаревшие файлы из Gist: {', '.join(stale)}")
     else:
         print("  MY_GIST_ID не задан.")
 
