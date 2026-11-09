@@ -54,13 +54,21 @@ GEOIP_DB_PATH = os.environ.get('GEOIP_DB', 'GeoLite2-Country.mmdb')
 
 # --- Фильтры ---
 FILTER_INSECURE    = on    # скрыть ⚠️ небезопасные (нет шифрования / allowInsecure=1)
-FILTER_LOCK        = on   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
+FILTER_LOCK        = off   # скрыть 🔒 обычный TLS (оставить только Reality 🔑)
 FILTER_RUSSIAN     = off   # скрыть 🇷🇺 российские серверы
 FILTER_INVALID_PBK = on    # скрыть Reality с битым pbk/sid
 FILTER_MITM        = on    # скрыть серверы, подменяющие HTTPS-сертификаты
 NAME_SHOW_SECURITY = on    # NEW: иконка защиты в начале имени (🔑 Reality / 🔒 TLS / ⚠️)
 NAME_NUMBERING     = on    # NEW: «Germany #1, #2…» (нумерация по пингу внутри группы)
 WHITELIST_LABEL    = "Белые списки"
+# Ваши собственные серверы (VPS, который вы подняли сами): ссылки по одной в строке
+# в файле my_servers.txt в Gist. Всегда попадают в начало подписки, в обход фильтров.
+MY_SERVERS_FILE    = "my_servers.txt"
+MY_LABEL           = "Мой сервер"
+# Публичные источники (igareck и др.). PUBLIC_SOURCES=0 — публиковать только свои серверы.
+USE_PUBLIC_SOURCES = os.environ.get('PUBLIC_SOURCES', '1') != '0'
+# Автоматический флот собственных серверов (см. fleet.py и токены HCLOUD_TOKEN / DO_TOKEN)
+FLEET_STATE_FILE   = "fleet.json"
 
 # ---------------------------------------------------------------------------
 # БЕЛЫЕ СПИСКИ: определяет сам код, а не подписи в источниках
@@ -117,6 +125,21 @@ XRAY_START_TIMEOUT = 5.0  if _slow else 3.5
 XRAY_PORT_BASE     = 25000
 
 # ---------------------------------------------------------------------------
+# ТОЧКА НАБЛЮДЕНИЯ ИЗ РФ (чтобы проверять не с американского раннера)
+# ---------------------------------------------------------------------------
+# Если задана, КАЖДЫЙ тест идёт так: раннер -> ENTRY_PROXY -> проверяемый сервер -> интернет.
+# То есть соединение с проверяемым сервером устанавливает не GitHub (США), а ваша
+# российская точка. Формат (лучше хранить в секрете ENTRY_PROXY, а не в коде):
+#   socks5://user:pass@host:port   |   http://user:pass@host:port   |   vless:// trojan:// ss://
+ENTRY_PROXY = os.environ.get('ENTRY_PROXY', '').strip()
+# 1 — точка наблюдения сама сидит в сети с белыми списками (SIM оператора, роутер с SIM):
+# тогда прошедшие тест серверы помечаются как проверенные (✓), а проверка
+# идёт по российским сайтам, т.к. зарубежные оттуда напрямую недоступны.
+ENTRY_IS_WHITELISTED_NET = os.environ.get('ENTRY_WL', '') == '1'
+ENTRY_WORKERS   = 8        # одна точка (телефон/VPS) не потянет 25 параллельных проверок
+ENTRY_DATA_TEST = off      # тест передачи данных ест мобильный трафик (~300 КБ на сервер)
+
+# ---------------------------------------------------------------------------
 # НАДЁЖНОСТЬ ПРОВЕРКИ (v3)
 # ---------------------------------------------------------------------------
 # Пинг и потери меряются ТОЛЬКО по HTTPS с проверкой сертификата (как реальный тест
@@ -157,41 +180,50 @@ _IGARECK_GITLAB = "https://gitlab.com/igareck/vpn-configs-for-russia/-/raw/main/
 _RJSXRD         = "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/"
 _COLORAMA       = "https://raw.githubusercontent.com/coloramamoe/vless-parser/main/githubmirror/"
 
-# ЯДРО — igareck: списки проходят автотесты с сервера в РФ каждые ~2 часа.
-# Живость проверена напрямую: BLACK_VLESS_RUS.txt (обновлён 23.10.2026),
-# WHITE-CIDR-RU-checked.txt (11.10.2026). Остальные файлы — из прежнего списка.
-SOURCES_CORE = [_IGARECK + f for f in (
-    "BLACK_VLESS_RUS.txt",
-    "BLACK_VLESS_RUS_mobile.txt",
-    "BLACK_SS+All_RUS.txt",
-    "WHITE-CIDR-RU-checked.txt",
-    "WHITE-SNI-RU-all.txt",
-    "Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "WHITE-CIDR-RU-all.txt",   # много почти-дублей; уберите, если не нужен
-)]
+# Каждый источник проверяется КОДОМ при каждом запуске, а не на слово:
+#   1) возраст по времени последнего коммита файла (GitHub API) — старше SOURCE_MAX_AGE_HOURS
+#      часов источник пропускается; для не-GitHub ссылок берётся заголовок Last-Modified,
+#      а если и его нет — смотрим, менялось ли содержимое с прошлого запуска;
+#   2) вклад: сколько конфигов источника реально прошло проверку. Источник, давший 0 живых
+#      несколько запусков подряд, автоматически отключается на неделю (потом проверяется снова).
+# Поэтому ссылки ниже — это КАНДИДАТЫ (пути взяты из README репозиториев); мёртвые и
+# заброшенные отсеются сами и будут показаны в отчёте в логе.
+SOURCE_MAX_AGE_HOURS = float(os.environ.get('SOURCE_MAX_AGE_HOURS', '24'))
+SOURCE_REQUIRE_FRESH_PROOF = off      # on = брать только источники с доказанной свежестью
+SOURCE_TIERS = {1, 2}                 # 1 — РФ-ориентированные, 2 — большие общие подборки, 3 — прочее
+MAX_XRAY_CANDIDATES = 2500            # потолок на xray-этап; tier 1 берётся первым
+SRC_STATE_FILE = "sources_state.json"
+SRC_DEAD_RUNS  = 3
+SRC_RETRY_DAYS = 7
 
-# ДОПОЛНИТЕЛЬНЫЕ — сторонние агрегаторы под белые списки РФ. Это чужие,
-# непроверяемые серверы: полагайтесь на FILTER_MITM и xray-проверку.
-# Репозитории активны (rjsxrd обновляется ежечасно, ~800 звёзд); сами raw-пути
-# взяты из их README и напрямую мной не открывались.
-SOURCES_EXTRA = [
-    _RJSXRD + "bypass/bypass-all.txt",              # SNI/CIDR bypass, до ~4500 конфигов
-    _COLORAMA + "whitelist-vless.txt",              # только валидные reality/tls VLESS
-    _COLORAMA + "ru-sni-best-vless.txt",            # reality с русским SNI
+_BARRY = "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/"
+_EPOD  = "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/"
+
+SOURCE_DEFS = [
+    # --- tier 1: ориентированы на РФ / белые списки ---
+    ("igareck/BLACK_VLESS_RUS",        _IGARECK + "BLACK_VLESS_RUS.txt", 1),
+    ("igareck/BLACK_VLESS_RUS_mobile", _IGARECK + "BLACK_VLESS_RUS_mobile.txt", 1),
+    ("igareck/BLACK_SS+All_RUS",       _IGARECK + "BLACK_SS+All_RUS.txt", 1),
+    ("igareck/WHITE-CIDR-RU-checked",  _IGARECK + "WHITE-CIDR-RU-checked.txt", 1),
+    ("igareck/WHITE-SNI-RU-all",       _IGARECK + "WHITE-SNI-RU-all.txt", 1),
+    ("igareck/Vless-Reality-WL-Mobile", _IGARECK + "Vless-Reality-White-Lists-Rus-Mobile.txt", 1),
+    ("igareck/WHITE-CIDR-RU-all",      _IGARECK + "WHITE-CIDR-RU-all.txt", 1),
+    ("rjsxrd/bypass-all",              _RJSXRD + "bypass/bypass-all.txt", 1),
+    ("rjsxrd/vless-secure",            _RJSXRD + "split-by-protocols/vless-secure.txt", 1),
+    ("vless-parser/whitelist-vless",   _COLORAMA + "whitelist-vless.txt", 1),
+    ("vless-parser/ru-sni-best",       _COLORAMA + "ru-sni-best-vless.txt", 1),
+    ("kort0881/clean-vless", "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/clean/vless.txt", 1),
+    # --- tier 2: большие общие подборки (обновление раз в 5–15 минут по заявлению авторов) ---
+    ("barry-far/vless",   _BARRY + "vless.txt", 2),
+    ("barry-far/trojan",  _BARRY + "trojan.txt", 2),
+    ("barry-far/ss",      _BARRY + "ss.txt", 2),
+    ("Epodonios/vless",   _EPOD + "vless.txt", 2),
+    ("Epodonios/trojan",  _EPOD + "trojan.txt", 2),
+    ("Epodonios/ss",      _EPOD + "ss.txt", 2),
+    ("ebrasha/vless", "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt", 2),
+    ("0xRadikal/verified", "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt", 2),
 ]
-
-# ОПЦИОНАЛЬНО — общие (не РФ-ориентированные) подборки; по умолчанию выключены.
-SOURCES_OPTIONAL = [
-    # "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt",
-    # "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt",
-    # _RJSXRD + "split-by-protocols/vless-secure.txt",
-]
-
-USE_EXTRA_SOURCES    = on
-USE_OPTIONAL_SOURCES = off
-SOURCES = (SOURCES_CORE
-           + (SOURCES_EXTRA if USE_EXTRA_SOURCES else [])
-           + (SOURCES_OPTIONAL if USE_OPTIONAL_SOURCES else []))
+SOURCES = [u for _, u, _ in SOURCE_DEFS]
 
 # Зеркала на случай недоступности GitHub (актуально при запуске из РФ).
 # Формат GitLab-raw стандартный, но конкретно эти ссылки я не открывал.
@@ -582,6 +614,66 @@ def _country_for(url: str, wl: bool) -> tuple:
     return code, name
 
 
+_MINE_IDS: set = set()
+
+
+def _fleet_links() -> list:
+    """Серверы, которыми автоматически управляет fleet.py (если задан токен провайдера)."""
+    try:
+        import fleet
+    except ImportError:
+        return []
+    if not fleet.enabled():
+        return []
+    if os.environ.get('GITHUB_ACTIONS') and not GID:
+        print("  [fleet] В GitHub Actions нужен MY_GIST_ID: без него состояние флота не сохранится "
+              "и каждый запуск создавал бы новые платные серверы. Флот пропущен.")
+        return []
+
+    def read():
+        if GID:
+            return _gist_read(FLEET_STATE_FILE)
+        if os.path.exists(FLEET_STATE_FILE):
+            with open(FLEET_STATE_FILE, encoding='utf-8') as f:
+                return f.read()
+        return None
+
+    def write(txt: str):
+        with open(FLEET_STATE_FILE, 'w', encoding='utf-8') as f:
+            f.write(txt)
+        if GID:
+            _update_gist({FLEET_STATE_FILE: txt})
+
+    print("\n[fleet] Проверка и пополнение собственных серверов...")
+    try:
+        return fleet.reconcile(lambda link: test_via_xray(link) is not None, read, write)
+    except Exception as e:
+        print(f"  [fleet] ошибка: {type(e).__name__}: {e}")
+        return []
+
+
+def load_my_servers() -> list:
+    txt = None
+    try:
+        txt = _gist_read(MY_SERVERS_FILE)
+    except Exception as e:
+        print(f"  Свои серверы: не прочитаны из Gist ({e})")
+    if not txt and os.path.exists(MY_SERVERS_FILE):
+        with open(MY_SERVERS_FILE, encoding='utf-8') as f:
+            txt = f.read()
+    urls = []
+    for u in PROTO_REGEX.findall(_decode_subscription(txt or '')) + _fleet_links():
+        p = parse_link(u)
+        if not p or p['proto'] not in SUPPORTED_PROTOS:
+            continue
+        ip = _resolve_ipv4(p['host'])
+        if ip:
+            _RESOLVED[p['host'].lower()] = ip
+        _MINE_IDS.add(_server_id(p))
+        urls.append(u)
+    return urls
+
+
 def _assign_names(results: list) -> collections.Counter:
     """Формирует имена: «🔑 🇩🇪 Germany #1» / «🔑 🇵🇱 Белые списки | Poland #1»
     (у серверов, проверенных внутри белых списков или вами, в конце ещё «✓»)."""
@@ -589,14 +681,18 @@ def _assign_names(results: list) -> collections.Counter:
     levels = collections.Counter()
     for entry in results:
         url = entry[0]
-        level = whitelist_level(url)
-        levels[level] += 1
+        p = parse_link(url)
+        mine = bool(p) and _server_id(p) in _MINE_IDS
+        level = 'none' if mine else whitelist_level(url)
+        levels['mine' if mine else level] += 1
         wl = level != 'none'
         code, cname = _country_for(url, wl)
         flag = _iso_to_flag(code) if code else '\U0001f310'
-        name = f"{flag} {WHITELIST_LABEL} | {cname}" if wl else f"{flag} {cname}"
+        label = MY_LABEL if mine else (WHITELIST_LABEL if wl else None)
+        name = f"{flag} {label} | {cname}" if label else f"{flag} {cname}"
         if NAME_NUMBERING:
-            n = counters[(wl, code)] = counters.get((wl, code), 0) + 1
+            group = ('mine' if mine else wl, code)
+            n = counters[group] = counters.get(group, 0) + 1
             name += f" #{n}"
         if level == 'verified':
             name += " \u2713"
@@ -786,6 +882,36 @@ def build_outbound(p: dict, tag: str = 'proxy', dialer: str | None = None) -> di
     return out
 
 
+def build_entry_outbound(spec: str, tag: str = 'ru') -> dict | None:
+    """Outbound точки наблюдения: socks5/http-прокси либо vless/trojan/ss-ссылка."""
+    spec = (spec or '').strip()
+    if not spec:
+        return None
+    u = urllib.parse.urlsplit(spec)
+    if u.scheme in ('socks5', 'socks5h', 'socks', 'http'):
+        try:
+            host, port = u.hostname, u.port
+        except ValueError:
+            return None
+        if not host or not port:
+            return None
+        server = {"address": host, "port": port}
+        if u.username:
+            server["users"] = [{"user": urllib.parse.unquote(u.username),
+                                "pass": urllib.parse.unquote(u.password or '')}]
+        return {"tag": tag, "protocol": "http" if u.scheme == 'http' else "socks",
+                "settings": {"servers": [server]}}
+    p = parse_link(spec)
+    return build_outbound(p, tag=tag) if p else None
+
+
+ENTRY_OUT = build_entry_outbound(ENTRY_PROXY) if ENTRY_PROXY else None
+if ENTRY_PROXY and ENTRY_OUT is None:
+    raise SystemExit("ENTRY_PROXY задан, но не распознан (ожидается socks5://, http://, vless://, trojan:// или ss://).")
+if ENTRY_OUT:
+    XRAY_WORKERS = ENTRY_WORKERS
+    CHAIN_PROXY = False        # цепочка по спискам не нужна, когда есть своя точка
+
 def build_config(outbound: dict, port: int, extra_outbounds: tuple | list = ()) -> dict:
     return {
         "log": {"loglevel": "none"},
@@ -892,11 +1018,12 @@ def tcp_alive(url: str):
     if any(addr in net for net in BLOCKED_NETS):
         if _is_ip_literal(host) or BLOCK_CDN_BY_DNS:
             return None
-    try:
-        with socket.create_connection((ip, port), timeout=TCP_TIMEOUT):
-            pass
-    except OSError:
-        return None
+    if not ENTRY_OUT:          # с точкой наблюдения прямой коннект из США ничего не доказывает
+        try:
+            with socket.create_connection((ip, port), timeout=TCP_TIMEOUT):
+                pass
+        except OSError:
+            return None
     _RESOLVED[host.lower()] = ip
     return url
 
@@ -909,7 +1036,7 @@ FAILS = collections.Counter()      # причины отказов xray-этап
 _fails_lock = threading.Lock()
 _KBPS: dict = {}                   # url -> скорость в тесте передачи данных
 _PROBE: dict = {}                  # url -> (ok, причина) прямого рукопожатия
-_data_test_enabled = DATA_TEST
+_data_test_enabled = DATA_TEST and (ENTRY_DATA_TEST or not ENTRY_OUT)
 REASON_RU = {
     'xray_start': 'xray не поднялся (битый конфиг/ключи)',
     'no_https':   'HTTPS через сервер не работает',
@@ -1102,7 +1229,9 @@ def test_via_xray(url: str, ru_url: str | None = None):
         if not rp:
             return None
         extra = [build_outbound(rp, tag='ru')]
-    out = build_outbound(p, tag='proxy', dialer='ru' if ru_url else None)
+    elif ENTRY_OUT:
+        extra = [dict(ENTRY_OUT, tag='ru')]
+    out = build_outbound(p, tag='proxy', dialer='ru' if extra else None)
 
     port = PORTS.acquire()
     try:
@@ -1198,26 +1327,113 @@ def _dedup_key(p: dict) -> tuple:
             tuple((k, q.get(k, '')) for k in keys))
 
 
-def fetch_configs() -> list:
-    with cf.ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
-        texts = list(ex.map(_fetch_with_retry, SOURCES))
+_RAW_RE = re.compile(r'^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)$')
+_CFG_SOURCES: dict = {}     # ключ сервера -> {имена источников}
+_CFG_TIER: dict = {}        # ключ сервера -> лучший tier
+_SRC_STATS: dict = {}       # имя источника -> {status, age, raw, keys}
+_SRC_STATE: dict = {}       # персистентное состояние (хэши, вклад по запускам, отключения)
+_gh_token_cache: dict = {}
 
-    all_raw = []
-    for src, raw in zip(SOURCES, texts):
-        if raw is None:
-            continue
-        text = _decode_subscription(raw)
-        found = PROTO_REGEX.findall(text)
-        fmt = "plain" if text == raw.strip() else "base64"
-        print(f"  [OK] {src.rsplit('/', 1)[-1]}  ->  {len(found)}  [{fmt}]")
-        all_raw.extend(found)
+
+def _iso_epoch(iso: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+
+
+def _source_age_hours(url: str) -> float | None:
+    """Часов с последнего изменения файла (None — определить не удалось)."""
+    try:
+        m = _RAW_RE.match(url)
+        if m:
+            owner, repo, branch, path = m.groups()
+            if 't' not in _gh_token_cache:
+                _gh_token_cache['t'] = _get_token()
+            headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'vpn-scout'}
+            if _gh_token_cache['t']:
+                headers['Authorization'] = f"Bearer {_gh_token_cache['t']}"
+            api = (f"https://api.github.com/repos/{owner}/{repo}/commits?sha={urllib.parse.quote(branch)}"
+                   f"&path={urllib.parse.quote(urllib.parse.unquote(path))}&per_page=1")
+            r = requests.get(api, headers=headers, timeout=15)
+            if r.status_code == 200 and r.json():
+                return (time.time() - _iso_epoch(r.json()[0]['commit']['committer']['date'])) / 3600
+            return None
+        r = requests.head(url, timeout=15, allow_redirects=True, headers={'User-Agent': 'Mozilla/5.0'})
+        lm = r.headers.get('Last-Modified')
+        if lm:
+            from email.utils import parsedate_to_datetime
+            return (time.time() - parsedate_to_datetime(lm).timestamp()) / 3600
+    except Exception:
+        pass
+    return None
+
+
+def _check_source(job: tuple) -> tuple:
+    name, url, tier = job
+    if _SRC_STATE.get(name, {}).get('disabled_until', 0) > time.time():
+        return job, None, None, 'disabled'
+    age = _source_age_hours(url)
+    if age is not None and age > SOURCE_MAX_AGE_HOURS:
+        return job, None, age, 'stale'
+    if age is None and SOURCE_REQUIRE_FRESH_PROOF:
+        return job, None, None, 'no-proof'
+    raw = _fetch_with_retry(url, retries=2)
+    return job, raw, age, ('ok' if raw else 'fail')
+
+
+def load_src_state():
+    txt = None
+    try:
+        txt = _gist_read(SRC_STATE_FILE)
+    except Exception as e:
+        print(f"  Состояние источников: не прочитано из Gist ({e})")
+    if not txt and os.path.exists(SRC_STATE_FILE):
+        with open(SRC_STATE_FILE, encoding='utf-8') as f:
+            txt = f.read()
+    try:
+        data = json.loads(txt) if txt else {}
+    except ValueError:
+        data = {}
+    _SRC_STATE.clear()
+    _SRC_STATE.update(data if isinstance(data, dict) else {})
+
+
+def fetch_configs() -> list:
+    now = time.time()
+    jobs = sorted([d for d in SOURCE_DEFS if d[2] in SOURCE_TIERS], key=lambda d: d[2])
+    with cf.ThreadPoolExecutor(max_workers=min(12, len(jobs) or 1)) as ex:
+        checked = list(ex.map(_check_source, jobs))
+
+    entries = []        # (cfg, имя источника, tier)
+    print(f"  Источники (макс. возраст {SOURCE_MAX_AGE_HOURS:g} ч):")
+    for (name, url, tier), raw, age, status in checked:
+        age_txt = f"{age:.1f} ч" if age is not None else "?"
+        if raw is not None:
+            h = hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
+            st = _SRC_STATE.setdefault(name, {})
+            if st.get('hash') != h:
+                st['hash'], st['changed'] = h, now
+            if age is None and now - st.get('changed', now) > SOURCE_MAX_AGE_HOURS * 3600:
+                status, raw = 'stale', None
+                age_txt = f">{(now - st['changed']) / 3600:.0f} ч без изменений"
+        label = {'ok': 'OK    ', 'stale': 'УСТАРЕЛ', 'disabled': 'ОТКЛ.  ',
+                 'fail': 'НЕТ    ', 'no-proof': 'БЕЗ ДОК.'}[status]
+        found = []
+        if raw is not None:
+            text = _decode_subscription(raw)
+            found = PROTO_REGEX.findall(text)
+            entries.extend((c, name, tier) for c in found)
+        _SRC_STATS[name] = {'status': status, 'age': age, 'raw': len(found), 'keys': set()}
+        print(f"    [{label}] tier{tier} {name:<34} возраст {age_txt:<18} конфигов {len(found)}")
 
     seen_keys, per_endpoint, unique = set(), {}, []
-    for cfg in all_raw:
+    for cfg, name, tier in entries:
         p = parse_link(cfg)
         if not p:
             continue
         key = _dedup_key(p)
+        _CFG_SOURCES.setdefault(key, set()).add(name)
+        _CFG_TIER[key] = min(tier, _CFG_TIER.get(key, 9))
+        _SRC_STATS[name]['keys'].add(key)
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -1227,6 +1443,38 @@ def fetch_configs() -> list:
         per_endpoint[ep] = per_endpoint.get(ep, 0) + 1
         unique.append(cfg)
     return unique
+
+
+def _cap_candidates(urls: list) -> list:
+    """Если живых слишком много — tier 1 берём целиком, остальное добираем случайно."""
+    if len(urls) <= MAX_XRAY_CANDIDATES:
+        return urls
+    tier = lambda u: _CFG_TIER.get(_dedup_key(parse_link(u)), 9)
+    first = [u for u in urls if tier(u) == 1]
+    rest = [u for u in urls if tier(u) != 1]
+    random.shuffle(rest)
+    kept = first + rest[:max(0, MAX_XRAY_CANDIDATES - len(first))]
+    print(f"      Кандидатов {len(urls)} > {MAX_XRAY_CANDIDATES}: tier1 {len(first)} + случайные {len(kept) - len(first)}")
+    return kept
+
+
+def _record_source_yield(results: list):
+    """Сколько конфигов каждого источника реально прошло; мёртвые источники отключаются."""
+    now = time.time()
+    passed = {_dedup_key(parse_link(r[0])) for r in results}
+    print("\n  Вклад источников (прошло / предложено):")
+    for name, stt in _SRC_STATS.items():
+        if stt['status'] != 'ok':
+            continue
+        n, ok = len(stt['keys']), len(stt['keys'] & passed)
+        rec = _SRC_STATE.setdefault(name, {})
+        rec['runs'] = (rec.get('runs', []) + [[n, ok]])[-6:]
+        last = rec['runs'][-SRC_DEAD_RUNS:]
+        dead = len(last) >= SRC_DEAD_RUNS and all(x[0] >= 20 and x[1] == 0 for x in last)
+        if dead:
+            rec['disabled_until'] = now + SRC_RETRY_DAYS * 86400
+        print(f"    {name:<34} {ok:>4} / {n:<5}" +
+              (f"  — {SRC_DEAD_RUNS} запуска подряд без живых: отключён на {SRC_RETRY_DAYS} дн." if dead else ""))
 
 
 def _static_filter(urls: list) -> tuple[list, dict]:
@@ -1395,10 +1643,48 @@ def _reachable(session: requests.Session, url: str, want_204: bool = False) -> b
         return False
 
 
+def _baseline_via_entry() -> bool:
+    """Проверяет саму точку наблюдения: поднимается ли xray с ней и ходит ли через неё трафик."""
+    global _RESTRICTED_NET
+    port = PORTS.acquire()
+    try:
+        cfg = build_config(dict(ENTRY_OUT, tag='proxy'), port)
+        with _xray(cfg, port) as started:
+            if not started:
+                print("  [!] xray не поднялся с точкой наблюдения (проверьте ENTRY_PROXY).")
+                return False
+            s = requests.Session()
+            s.trust_env = False
+            s.proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+            try:
+                if ENTRY_IS_WHITELISTED_NET:
+                    ok = any(_reachable(s, u) for u in RU_CONTROL_URLS)
+                else:
+                    good = [u for u in HTTPS_TARGETS if _reachable(s, u, want_204=True)]
+                    ok = bool(good)
+                    if ok:
+                        HTTPS_TARGETS[:] = good
+            finally:
+                s.close()
+    finally:
+        PORTS.release(port)
+    kind = ENTRY_OUT['protocol']
+    host = ENTRY_OUT['settings'].get('servers', [{}])[0].get('address') or ENTRY_OUT['settings'].get('vnext', [{}])[0].get('address', '?')
+    if not ok:
+        print(f"  [!] Точка наблюдения ({kind}://{host}) не пропускает трафик к контрольным адресам.")
+        return False
+    _RESTRICTED_NET = ENTRY_IS_WHITELISTED_NET
+    print(f"  Точка наблюдения из РФ: {kind}://{host}  "
+          f"({'сеть с БЕЛЫМИ СПИСКАМИ — прошедшие тест помечаются ✓' if _RESTRICTED_NET else 'обычная российская сеть'})")
+    return True
+
+
 def _baseline_check() -> bool:
     """Прямые запросы к целям проверки. Заодно определяет, не запущен ли скрипт
     внутри сети с белыми списками: российские сайты доступны, зарубежные — нет."""
     global _data_test_enabled, _RESTRICTED_NET
+    if ENTRY_OUT:
+        return _baseline_via_entry()
     s = requests.Session()
     s.trust_env = False
     good = [u for u in HTTPS_TARGETS if _reachable(s, u, want_204=True)]
@@ -1449,6 +1735,72 @@ def _print_fails(title: str, counter: collections.Counter):
         print(f"    {k:>4}  {REASON_RU.get(reason, reason)}")
 
 
+def _publish(intl_pool: list, ru_pool: list, history, t_start: float):
+    """Свои серверы + отобранные публичные -> имена, файлы, Gist."""
+    intl_results = sorted(intl_pool, key=_rank_key)[:TOP_N_EACH]
+    ru_results   = sorted(ru_pool,   key=_rank_key)[:TOP_N_EACH]
+    mine_urls = load_my_servers() if MY_SERVERS_FILE else []
+    if mine_urls:
+        print(f"  Свои серверы: {len(mine_urls)} (публикуются первыми, в обход фильтров)")
+        mine_entries = []
+        for u in mine_urls:
+            r = test_via_xray(u)
+            print(f"    {'OK ' if r else 'НЕТ'} {parse_link(u)['host']}:{parse_link(u)['port']}"
+                  f"{f'  {r[2]}мс' if r else '  не отвечает при проверке (всё равно публикуется)'}")
+            mine_entries.append(r or (u, 0, 0, 0, 0))
+        intl_results = mine_entries + [e for e in intl_results if _server_id(parse_link(e[0])) not in _MINE_IDS]
+        ru_results = [e for e in ru_results if _server_id(parse_link(e[0])) not in _MINE_IDS]
+    lv_i = _assign_names(intl_results)
+    lv_r = _assign_names(ru_results)
+    for title, lv, n in (("зарубежные", lv_i, len(intl_results)), ("российские", lv_r, len(ru_results))):
+        print(f"  Белые списки, {title}: проверено ✓ {lv['verified']}, по спискам IP/SNI {lv['likely']}, мои {lv['mine']}, "
+              f"не определены {lv['none']}  (из {n})")
+    elapsed = int(time.time() - t_start)
+
+    print(f"\n{'─' * 60}")
+    print(f"  Зарубежных: {len(intl_results)}   Российских: {len(ru_results)}   Время: {elapsed}с")
+    print(f"{'─' * 60}")
+    for i, (url, _s, avg, jitter, losses) in enumerate(intl_results[:10], 1):
+        up = _uptime(url)
+        print(f"  {i:<3}{avg:>5}мс  {_KBPS.get(url, 0):>5.0f}КБ/с  "
+              f"аптайм:{'—' if up is None else f'{up:.0%}':>5}  {_NAMES.get(url, '')}")
+
+    _print_breakdown(intl_results + ru_results)
+
+    if not intl_results:
+        print("Серверов для публикации нет — файлы не перезаписываются.")
+        return
+
+    vps_text = "\n".join(_tagged_url(r[0]) for r in intl_results)
+    sub_text = base64.b64encode(vps_text.encode("utf-8")).decode("ascii")
+
+    files = {FILE_NAME: vps_text, SUB_FILE: sub_text}
+    if history is not None:
+        files[HISTORY_FILE] = json.dumps(history, separators=(',', ':'))
+    if _SRC_STATE:
+        files[SRC_STATE_FILE] = json.dumps(_SRC_STATE, separators=(',', ':'))
+    if PUBLISH_RU_FILES and ru_results:
+        ru_text = "\n".join(_tagged_url(r[0]) for r in ru_results)
+        files[RU_FILE] = ru_text
+        files[RU_SUB_FILE] = base64.b64encode(ru_text.encode("utf-8")).decode("ascii")
+    for name, content in files.items():
+        with open(name, "w", encoding="utf-8") as f:
+            f.write(content)
+    print(f"\n Сохранено: {FILE_NAME} ({len(intl_results)}), {SUB_FILE}")
+
+    if GID:
+        print("Обновляем Gist...")
+        stale = []
+        with contextlib.suppress(Exception):
+            stale = [n for n in OBSOLETE_GIST_FILES if n in _gist_filenames()]
+        _update_gist(files, delete=stale)
+        if stale:
+            print(f" Удалены устаревшие файлы из Gist: {', '.join(stale)}")
+    else:
+        print("  MY_GIST_ID не задан.")
+
+
+
 def run():
     t_start = time.time()
 
@@ -1460,6 +1812,7 @@ def run():
     print("  VPN SCOUT 3.0")
     print(f"  {ver[0] if ver else 'xray: версия неизвестна'}")
     print(f"  xray: {XRAY_WORKERS} воркеров, раундов {PING_ROUNDS}, макс. пинг {MAX_PING_MS}мс")
+    print(f"  Точка наблюдения: {'ЗАДАНА (ENTRY_PROXY)' if ENTRY_OUT else 'нет — проверка идёт напрямую с этой машины'}")
     print(f"  Белые списки: определение {'ВКЛ, правило ' + WL_RULE if WL_DETECT else 'ВЫКЛ'}")
     print(f"  Проба рукопожатия: {'ВКЛ' if PROBE_HANDSHAKE else 'ВЫКЛ'} | "
           f"подтверждающий проход: {'ВКЛ' if CONFIRM_PASS else 'ВЫКЛ'} | "
@@ -1475,12 +1828,17 @@ def run():
     if WL_DETECT:
         load_good_list()
 
+    if not USE_PUBLIC_SOURCES:
+        print("\nПубличные источники отключены (PUBLIC_SOURCES=0) — публикую только свои серверы.")
+        return _publish([], [], None, t_start)
+
     print("\n[1/7] Сбор конфигов...")
+    load_src_state()
     configs = fetch_configs()
     print(f"      Уникальных серверов (без дублей по fp; до {MAX_PER_ENDPOINT} вариантов на host:port): {len(configs)}")
     if not configs:
         print("Нет кандидатов.")
-        return
+        return _publish([], [], None, t_start)
 
     configs, cnt = _static_filter(configs)
     print(f"[2/7] Статические фильтры: осталось {len(configs)} "
@@ -1494,7 +1852,7 @@ def run():
     print(f"      TCP живых: {len(alive)} / {len(configs)}  ({int(time.time() - t_start)}с)")
     if not alive:
         print("Нет живых серверов после TCP-проверки.")
-        return
+        return _publish([], [], None, t_start)
 
     if FILTER_RUSSIAN and not CHAIN_PROXY:
         before = len(alive)
@@ -1502,7 +1860,9 @@ def run():
                  if not _is_russian_server(parse_link(u)['host'], u) or whitelist_level(u) != 'none']
         print(f"      Российских отброшено до xray: {before - len(alive)}")
 
-    if PROBE_HANDSHAKE:
+    alive = _cap_candidates(alive)
+
+    if PROBE_HANDSHAKE and not ENTRY_OUT:
         print(f"\n[4/7] Прямая проба TLS/Reality-рукопожатия ({len(alive)} серверов)...")
         with cf.ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
             probes = list(ex.map(probe_handshake, alive))
@@ -1520,10 +1880,10 @@ def run():
             print(f"      Провалили пробу, но пропущены (нестрогий режим): {sum(shadow.values())}  {dict(shadow)}")
         alive = keep
     else:
-        print("\n[4/7] Проба рукопожатия отключена.")
+        print("\n[4/7] Проба рукопожатия пропущена" + (" (тесты идут через точку наблюдения)." if ENTRY_OUT else " (отключена)."))
     if not alive:
         print("Нет серверов после пробы.")
-        return
+        return _publish([], [], None, t_start)
 
     print(f"\n[5/7] xray-проверка {len(alive)} серверов (HTTPS, перехват, передача данных)...")
     results = _run_xray_stage(alive, "xray")
@@ -1535,7 +1895,7 @@ def run():
               f"{sum(1 for u in shadow_urls if u in passed_urls)}")
     if not results:
         print("Нет рабочих серверов.")
-        return
+        return _publish([], [], None, t_start)
 
     if CONFIRM_PASS:
         print(f"\n[6/7] Подтверждающий проход через {CONFIRM_DELAY}с ({len(results)} серверов)...")
@@ -1552,7 +1912,7 @@ def run():
         results = merged
         if not results:
             print("Нет подтверждённых серверов.")
-            return
+            return _publish([], [], None, t_start)
     else:
         print("\n[6/7] Подтверждающий проход отключён.")
 
@@ -1604,54 +1964,8 @@ def run():
         intl_pool = [e for e in intl_pool if _check_sni(e[0])]
         ru_pool   = [e for e in ru_pool   if _check_sni(e[0])]
 
-    intl_results = sorted(intl_pool, key=_rank_key)[:TOP_N_EACH]
-    ru_results   = sorted(ru_pool,   key=_rank_key)[:TOP_N_EACH]
-    lv_i = _assign_names(intl_results)
-    lv_r = _assign_names(ru_results)
-    for title, lv, n in (("зарубежные", lv_i, len(intl_results)), ("российские", lv_r, len(ru_results))):
-        print(f"  Белые списки, {title}: проверено ✓ {lv['verified']}, по спискам IP/SNI {lv['likely']}, "
-              f"не определены {lv['none']}  (из {n})")
-    elapsed = int(time.time() - t_start)
-
-    print(f"\n{'─' * 60}")
-    print(f"  Зарубежных: {len(intl_results)}   Российских: {len(ru_results)}   Время: {elapsed}с")
-    print(f"{'─' * 60}")
-    for i, (url, _s, avg, jitter, losses) in enumerate(intl_results[:10], 1):
-        up = _uptime(url)
-        print(f"  {i:<3}{avg:>5}мс  {_KBPS.get(url, 0):>5.0f}КБ/с  "
-              f"аптайм:{'—' if up is None else f'{up:.0%}':>5}  {_NAMES.get(url, '')}")
-
-    _print_breakdown(intl_results + ru_results)
-
-    if not intl_results:
-        print("Зарубежных серверов после фильтров нет — файлы не перезаписываются.")
-        return
-
-    vps_text = "\n".join(_tagged_url(r[0]) for r in intl_results)
-    sub_text = base64.b64encode(vps_text.encode("utf-8")).decode("ascii")
-
-    files = {FILE_NAME: vps_text, SUB_FILE: sub_text,
-             HISTORY_FILE: json.dumps(history, separators=(',', ':'))}
-    if PUBLISH_RU_FILES and ru_results:
-        ru_text = "\n".join(_tagged_url(r[0]) for r in ru_results)
-        files[RU_FILE] = ru_text
-        files[RU_SUB_FILE] = base64.b64encode(ru_text.encode("utf-8")).decode("ascii")
-    for name, content in files.items():
-        with open(name, "w", encoding="utf-8") as f:
-            f.write(content)
-    print(f"\n Сохранено: {FILE_NAME} ({len(intl_results)}), {SUB_FILE}, {HISTORY_FILE}")
-
-    if GID:
-        print("Обновляем Gist...")
-        stale = []
-        with contextlib.suppress(Exception):
-            stale = [n for n in OBSOLETE_GIST_FILES if n in _gist_filenames()]
-        _update_gist(files, delete=stale)
-        if stale:
-            print(f" Удалены устаревшие файлы из Gist: {', '.join(stale)}")
-    else:
-        print("  MY_GIST_ID не задан.")
-
+    _record_source_yield(results)
+    return _publish(intl_pool, ru_pool, history, t_start)
 
 if __name__ == "__main__":
     run()
