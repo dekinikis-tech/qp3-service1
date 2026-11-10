@@ -200,8 +200,20 @@ SRC_RETRY_DAYS = 7
 _BARRY = "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/"
 _EPOD  = "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/"
 
+_TELEGA = "https://raw.githubusercontent.com/TelegaVPN/free-vpn-keys/main/"
+_GRISHA = "https://raw.githubusercontent.com/grisha-seleznev/free-vless-keys-russia/main/"
+
 SOURCE_DEFS = [
     # --- tier 1: ориентированы на РФ / белые списки ---
+    # grisha-seleznev: каждый ключ проверяется настоящим подключением через xray; на 10.11.2026
+    # README показывал «обновлено 10.11.2026 11:34 МСК, ключей 37, обновление каждые 3 часа».
+    ("grisha-seleznev/sub", _GRISHA + "sub.txt", 1),
+    # TelegaVPN / vpnkeys.me: по описанию авторов, узлы проверяются каждые 15–30 минут реальным
+    # xray-рукопожатием, в том числе с российского провайдера (г. Кемерово). Бесплатно при
+    # указании авторства: vpnkeys.me / github.com/TelegaVPN/free-vpn-keys.
+    ("TelegaVPN/for-russia", _TELEGA + "sub/base64/for-russia.txt", 1),
+    ("vpnkeys.me/api", "https://vpnkeys.me/api/v1/keys?protocol=vless,trojan,ss&for_russia=1&min_uptime=0.8&sort=reputation&limit=300&format=plain", 1),
+    ("kort0881/ru-sni", "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/ru-sni/vless_ru.txt", 1),
     ("igareck/BLACK_VLESS_RUS",        _IGARECK + "BLACK_VLESS_RUS.txt", 1),
     ("igareck/BLACK_VLESS_RUS_mobile", _IGARECK + "BLACK_VLESS_RUS_mobile.txt", 1),
     ("igareck/BLACK_SS+All_RUS",       _IGARECK + "BLACK_SS+All_RUS.txt", 1),
@@ -234,12 +246,17 @@ SOURCE_DEFS = [
     # --- Telegram-каналы с конфигами ТЕКСТОМ (источник "tg:<канал>"): берутся только сообщения
     #     моложе SOURCE_MAX_AGE_HOURS, так что свежесть измеряется точно, по времени постов ---
     ("tg/allproconf", "tg:allproconf", 2),
+    # Каналы проектов выше (автопостинг узлов); не проверено, постят ли ключи текстом — если нет,
+    # источник сам окажется «УСТАРЕЛ»/без вклада и отключится.
+    ("tg/free_outline_keys", "tg:free_outline_keys", 2),
+    ("tg/bounty_configs", "tg:bounty_configs", 2),
 ]
 SOURCES = [u for _, u, _ in SOURCE_DEFS]
 
 # Зеркала на случай недоступности GitHub (актуально при запуске из РФ).
 # Формат GitLab-raw стандартный, но конкретно эти ссылки я не открывал.
-MIRRORS = {_IGARECK: _IGARECK_GITLAB}
+MIRRORS = {_IGARECK: _IGARECK_GITLAB,
+           _TELEGA: "https://cdn.jsdelivr.net/gh/TelegaVPN/free-vpn-keys@main/"}
 
 BLACK_LIST = [
     'meshky', '4mohsen', 'white', '708087',
